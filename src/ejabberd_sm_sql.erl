@@ -1,11 +1,27 @@
 %%%-------------------------------------------------------------------
-%%% @author Evgeny Khramtsov <ekhramtsov@process-one.net>
-%%% @copyright (C) 2015-2016, Evgeny Khramtsov
-%%% @doc
-%%%
-%%% @end
+%%% File    : ejabberd_sm_sql.erl
+%%% Author  : Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%% Created :  9 Mar 2015 by Evgeny Khramtsov <ekhramtsov@process-one.net>
-%%%-------------------------------------------------------------------
+%%%
+%%%
+%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
+%%%
+%%% This program is free software; you can redistribute it and/or
+%%% modify it under the terms of the GNU General Public License as
+%%% published by the Free Software Foundation; either version 2 of the
+%%% License, or (at your option) any later version.
+%%%
+%%% This program is distributed in the hope that it will be useful,
+%%% but WITHOUT ANY WARRANTY; without even the implied warranty of
+%%% MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+%%% General Public License for more details.
+%%%
+%%% You should have received a copy of the GNU General Public License along
+%%% with this program; if not, write to the Free Software Foundation, Inc.,
+%%% 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+%%%
+%%%----------------------------------------------------------------------
+
 -module(ejabberd_sm_sql).
 
 -compile([{parse_transform, ejabberd_sql_pt}]).
@@ -15,16 +31,14 @@
 %% API
 -export([init/0,
 	 set_session/1,
-	 delete_session/4,
+	 delete_session/1,
 	 get_sessions/0,
 	 get_sessions/1,
-	 get_sessions/2,
-	 get_sessions/3]).
+	 get_sessions/2]).
 
 -include("ejabberd.hrl").
 -include("ejabberd_sm.hrl").
 -include("logger.hrl").
--include("jlib.hrl").
 -include("ejabberd_sql_pt.hrl").
 
 %%%===================================================================
@@ -32,8 +46,8 @@
 %%%===================================================================
 -spec init() -> ok | {error, any()}.
 init() ->
-    Node = jlib:atom_to_binary(node()),
-    ?INFO_MSG("Cleaning SQL SM table...", []),
+    Node = erlang:atom_to_binary(node(), latin1),
+    ?DEBUG("Cleaning SQL SM table...", []),
     lists:foldl(
       fun(Host, ok) ->
 	      case ejabberd_sql:sql_query(
@@ -50,44 +64,36 @@ init() ->
 
 set_session(#session{sid = {Now, Pid}, usr = {U, LServer, R},
 		     priority = Priority, info = Info}) ->
-    InfoS = jlib:term_to_expr(Info),
+    InfoS = misc:term_to_expr(Info),
     PrioS = enc_priority(Priority),
     TS = now_to_timestamp(Now),
-    PidS = list_to_binary(erlang:pid_to_list(Pid)),
-    Node = jlib:atom_to_binary(node(Pid)),
+    PidS = misc:encode_pid(Pid),
+    Node = erlang:atom_to_binary(node(Pid), latin1),
     case ?SQL_UPSERT(LServer, "sm",
                      ["!usec=%(TS)d",
                       "!pid=%(PidS)s",
                       "node=%(Node)s",
                       "username=%(U)s",
+                      "server_host=%(LServer)s",
                       "resource=%(R)s",
                       "priority=%(PrioS)s",
                       "info=%(InfoS)s"]) of
 	ok ->
 	    ok;
-	Err ->
-	    ?ERROR_MSG("failed to update 'sm' table: ~p", [Err])
+	_Err ->
+	    {error, db_failure}
     end.
 
-delete_session(_LUser, LServer, _LResource, {Now, Pid}) ->
+delete_session(#session{usr = {_, LServer, _}, sid = {Now, Pid}}) ->
     TS = now_to_timestamp(Now),
     PidS = list_to_binary(erlang:pid_to_list(Pid)),
     case ejabberd_sql:sql_query(
 	   LServer,
-	   ?SQL("select @(usec)d, @(pid)s, @(username)s,"
-                " @(resource)s, @(priority)s, @(info)s "
-                "from sm where usec=%(TS)d and pid=%(PidS)s")) of
-	{selected, [Row]} ->
-            ejabberd_sql:sql_query(
-              LServer,
-              ?SQL("delete from sm"
-                   " where usec=%(TS)d and pid=%(PidS)s")),
-	    {ok, row_to_session(LServer, Row)};
-	{selected, []} ->
-	    {error, notfound};
-	Err ->
-	    ?ERROR_MSG("failed to delete from 'sm' table: ~p", [Err]),
-	    {error, notfound}
+	   ?SQL("delete from sm where usec=%(TS)d and pid=%(PidS)s")) of
+	{updated, _} ->
+	    ok;
+	_Err ->
+	    {error, db_failure}
     end.
 
 get_sessions() ->
@@ -99,39 +105,35 @@ get_sessions() ->
 get_sessions(LServer) ->
     case ejabberd_sql:sql_query(
 	   LServer,
-           ?SQL("select @(usec)d, @(pid)s, @(username)s,"
-                " @(resource)s, @(priority)s, @(info)s from sm")) of
+           ?SQL("select @(usec)d, @(pid)s, @(node)s, @(username)s,"
+                " @(resource)s, @(priority)s, @(info)s from sm"
+                " where %(LServer)H")) of
 	{selected, Rows} ->
-	    [row_to_session(LServer, Row) || Row <- Rows];
-	Err ->
-	    ?ERROR_MSG("failed to select from 'sm' table: ~p", [Err]),
+	    lists:flatmap(
+	      fun(Row) ->
+		      try [row_to_session(LServer, Row)]
+		      catch _:{bad_node, _} -> []
+		      end
+	      end, Rows);
+	_Err ->
 	    []
     end.
 
 get_sessions(LUser, LServer) ->
     case ejabberd_sql:sql_query(
 	   LServer,
-           ?SQL("select @(usec)d, @(pid)s, @(username)s,"
+           ?SQL("select @(usec)d, @(pid)s, @(node)s, @(username)s,"
                 " @(resource)s, @(priority)s, @(info)s from sm"
-                " where username=%(LUser)s")) of
+                " where username=%(LUser)s and %(LServer)H")) of
 	{selected, Rows} ->
-	    [row_to_session(LServer, Row) || Row <- Rows];
-	Err ->
-	    ?ERROR_MSG("failed to select from 'sm' table: ~p", [Err]),
-	    []
-    end.
-
-get_sessions(LUser, LServer, LResource) ->
-    case ejabberd_sql:sql_query(
-	   LServer,
-           ?SQL("select @(usec)d, @(pid)s, @(username)s,"
-                " @(resource)s, @(priority)s, @(info)s from sm"
-                " where username=%(LUser)s and resource=%(LResource)s")) of
-	{selected, Rows} ->
-	    [row_to_session(LServer, Row) || Row <- Rows];
-	Err ->
-	    ?ERROR_MSG("failed to select from 'sm' table: ~p", [Err]),
-	    []
+	    {ok, lists:flatmap(
+		   fun(Row) ->
+			   try [row_to_session(LServer, Row)]
+			   catch _:{bad_node, _} -> []
+			   end
+		   end, Rows)};
+	_Err ->
+	    {error, db_failure}
     end.
 
 %%%===================================================================
@@ -144,11 +146,11 @@ timestamp_to_now(I) ->
     Head = I div 1000000,
     USec = I rem 1000000,
     MSec = Head div 1000000,
-    Sec = Head div 1000000,
+    Sec = Head rem 1000000,
     {MSec, Sec, USec}.
 
 dec_priority(Prio) ->
-    case catch jlib:binary_to_integer(Prio) of
+    case catch binary_to_integer(Prio) of
 	{'EXIT', _} ->
 	    undefined;
 	Int ->
@@ -158,11 +160,11 @@ dec_priority(Prio) ->
 enc_priority(undefined) ->
     <<"">>;
 enc_priority(Int) when is_integer(Int) ->
-    jlib:integer_to_binary(Int).
+    integer_to_binary(Int).
 
-row_to_session(LServer, {USec, PidS, User, Resource, PrioS, InfoS}) ->
+row_to_session(LServer, {USec, PidS, NodeS, User, Resource, PrioS, InfoS}) ->
     Now = timestamp_to_now(USec),
-    Pid = erlang:list_to_pid(binary_to_list(PidS)),
+    Pid = misc:decode_pid(PidS, NodeS),
     Priority = dec_priority(PrioS),
     Info = ejabberd_sql:decode_term(InfoS),
     #session{sid = {Now, Pid}, us = {User, LServer},

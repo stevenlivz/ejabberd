@@ -5,7 +5,7 @@
 %%% Created :  2 Jan 2003 by Alexey Shchepin <alexey@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2016   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -30,85 +30,154 @@
 -protocol({xep, 54, '1.2'}).
 -protocol({xep, 55, '1.3'}).
 
+-behaviour(gen_server).
 -behaviour(gen_mod).
 
--export([start/2, init/3, stop/1, get_sm_features/5,
-	 process_local_iq/3, process_sm_iq/3, string2lower/1,
-	 remove_user/2, export/1, import/1, import/3, depends/2,
-	 mod_opt_type/1, set_vcard/3, make_vcard_search/4]).
+-export([start/2, stop/1, get_sm_features/5, mod_options/1,
+	 process_local_iq/1, process_sm_iq/1, string2lower/1,
+	 remove_user/2, export/1, import_info/0, import/5, import_start/2,
+	 depends/2, process_search/1, process_vcard/1, get_vcard/2,
+	 disco_items/5, disco_features/5, disco_identity/5,
+	 vcard_iq_set/1, mod_opt_type/1, set_vcard/3, make_vcard_search/4]).
+-export([init/1, handle_call/3, handle_cast/2,
+	 handle_info/2, terminate/2, code_change/3]).
 
 -include("ejabberd.hrl").
 -include("logger.hrl").
--include("jlib.hrl").
+-include("xmpp.hrl").
 -include("mod_vcard.hrl").
+-include("translate.hrl").
 
--define(JUD_MATCHES, 30).
-
--define(PROCNAME, ejabberd_mod_vcard).
+-define(VCARD_CACHE, vcard_cache).
 
 -callback init(binary(), gen_mod:opts()) -> any().
--callback import(binary(), #vcard{} | #vcard_search{}) -> ok | pass.
--callback get_vcard(binary(), binary()) -> [xmlel()] | error.
+-callback stop(binary()) -> any().
+-callback import(binary(), binary(), [binary()]) -> ok.
+-callback get_vcard(binary(), binary()) -> {ok, [xmlel()]} | error.
 -callback set_vcard(binary(), binary(),
 		    xmlel(), #vcard_search{}) -> {atomic, any()}.
+-callback search_fields(binary()) -> [{binary(), binary()}].
+-callback search_reported(binary()) -> [{binary(), binary()}].
 -callback search(binary(), [{binary(), [binary()]}], boolean(),
-		 infinity | pos_integer()) -> [binary()].
+		 infinity | pos_integer()) -> [{binary(), binary()}].
 -callback remove_user(binary(), binary()) -> {atomic, any()}.
+-callback is_search_supported(binary()) -> boolean().
+-callback use_cache(binary()) -> boolean().
+-callback cache_nodes(binary()) -> [node()].
 
+-optional_callbacks([use_cache/1, cache_nodes/1]).
+
+-record(state, {hosts :: [binary()], server_host :: binary()}).
+
+%%====================================================================
+%% gen_mod callbacks
+%%====================================================================
 start(Host, Opts) ->
-    Mod = gen_mod:db_mod(Host, Opts, ?MODULE),
-    Mod:init(Host, Opts),
-    ejabberd_hooks:add(remove_user, Host, ?MODULE,
-		       remove_user, 50),
-    IQDisc = gen_mod:get_opt(iqdisc, Opts, fun gen_iq_handler:check_type/1,
-                             one_queue),
-    gen_iq_handler:add_iq_handler(ejabberd_local, Host,
-				  ?NS_VCARD, ?MODULE, process_local_iq, IQDisc),
-    gen_iq_handler:add_iq_handler(ejabberd_sm, Host,
-				  ?NS_VCARD, ?MODULE, process_sm_iq, IQDisc),
-    ejabberd_hooks:add(disco_sm_features, Host, ?MODULE,
-		       get_sm_features, 50),
-    MyHost = gen_mod:get_opt_host(Host, Opts,
-				  <<"vjud.@HOST@">>),
-    Search = gen_mod:get_opt(search, Opts,
-                             fun(B) when is_boolean(B) -> B end,
-                             false),
-    register(gen_mod:get_module_proc(Host, ?PROCNAME),
-	     spawn(?MODULE, init, [MyHost, Host, Search])).
-
-init(Host, ServerHost, Search) ->
-    case Search of
-      false -> loop(Host, ServerHost);
-      _ ->
-	  ejabberd_router:register_route(Host, ServerHost),
-	  loop(Host, ServerHost)
-    end.
-
-loop(Host, ServerHost) ->
-    receive
-      {route, From, To, Packet} ->
-	  case catch do_route(ServerHost, From, To, Packet) of
-	    {'EXIT', Reason} -> ?ERROR_MSG("~p", [Reason]);
-	    _ -> ok
-	  end,
-	  loop(Host, ServerHost);
-      stop -> ejabberd_router:unregister_route(Host), ok;
-      _ -> loop(Host, ServerHost)
-    end.
+    gen_mod:start_child(?MODULE, Host, Opts).
 
 stop(Host) ->
-    ejabberd_hooks:delete(remove_user, Host, ?MODULE,
-			  remove_user, 50),
-    gen_iq_handler:remove_iq_handler(ejabberd_local, Host,
-				     ?NS_VCARD),
-    gen_iq_handler:remove_iq_handler(ejabberd_sm, Host,
-				     ?NS_VCARD),
-    ejabberd_hooks:delete(disco_sm_features, Host, ?MODULE,
-			  get_sm_features, 50),
-    Proc = gen_mod:get_module_proc(Host, ?PROCNAME),
-    Proc ! stop,
-    {wait, Proc}.
+    gen_mod:stop_child(?MODULE, Host).
 
+%%====================================================================
+%% gen_server callbacks
+%%====================================================================
+init([Host, Opts]) ->
+    process_flag(trap_exit, true),
+    Mod = gen_mod:db_mod(Host, Opts, ?MODULE),
+    Mod:init(Host, Opts),
+    init_cache(Mod, Host, Opts),
+    ejabberd_hooks:add(remove_user, Host, ?MODULE,
+		       remove_user, 50),
+    gen_iq_handler:add_iq_handler(ejabberd_local, Host,
+				  ?NS_VCARD, ?MODULE, process_local_iq),
+    gen_iq_handler:add_iq_handler(ejabberd_sm, Host,
+				  ?NS_VCARD, ?MODULE, process_sm_iq),
+    ejabberd_hooks:add(disco_sm_features, Host, ?MODULE,
+		       get_sm_features, 50),
+    ejabberd_hooks:add(vcard_iq_set, Host, ?MODULE, vcard_iq_set, 50),
+    MyHosts = gen_mod:get_opt_hosts(Host, Opts),
+    Search = gen_mod:get_opt(search, Opts),
+    if Search ->
+	    lists:foreach(
+	      fun(MyHost) ->
+		      ejabberd_hooks:add(
+			disco_local_items, MyHost, ?MODULE, disco_items, 100),
+		      ejabberd_hooks:add(
+			disco_local_features, MyHost, ?MODULE, disco_features, 100),
+		      ejabberd_hooks:add(
+			disco_local_identity, MyHost, ?MODULE, disco_identity, 100),
+		      gen_iq_handler:add_iq_handler(
+			ejabberd_local, MyHost, ?NS_SEARCH, ?MODULE, process_search),
+		      gen_iq_handler:add_iq_handler(
+			ejabberd_local, MyHost, ?NS_VCARD, ?MODULE, process_vcard),
+		      gen_iq_handler:add_iq_handler(
+			ejabberd_local, MyHost, ?NS_DISCO_ITEMS, mod_disco,
+			process_local_iq_items),
+		      gen_iq_handler:add_iq_handler(
+			ejabberd_local, MyHost, ?NS_DISCO_INFO, mod_disco,
+			process_local_iq_info),
+		      case Mod:is_search_supported(Host) of
+			  false ->
+			      ?WARNING_MSG("vcard search functionality is "
+					   "not implemented for ~s backend",
+					   [gen_mod:get_opt(db_type, Opts)]);
+			  true ->
+			      ejabberd_router:register_route(MyHost, Host)
+		      end
+	      end, MyHosts);
+       true ->
+	    ok
+    end,
+    {ok, #state{hosts = MyHosts, server_host = Host}}.
+
+handle_call(_Call, _From, State) ->
+    {noreply, State}.
+
+handle_cast(Cast, State) ->
+    ?WARNING_MSG("unexpected cast: ~p", [Cast]),
+    {noreply, State}.
+
+handle_info({route, Packet}, State) ->
+    case catch do_route(Packet) of
+	{'EXIT', Reason} -> ?ERROR_MSG("~p", [Reason]);
+	_ -> ok
+    end,
+    {noreply, State};
+handle_info(Info, State) ->
+    ?WARNING_MSG("unexpected info: ~p", [Info]),
+    {noreply, State}.
+
+terminate(_Reason, #state{hosts = MyHosts, server_host = Host}) ->
+    ejabberd_hooks:delete(remove_user, Host, ?MODULE, remove_user, 50),
+    gen_iq_handler:remove_iq_handler(ejabberd_local, Host, ?NS_VCARD),
+    gen_iq_handler:remove_iq_handler(ejabberd_sm, Host, ?NS_VCARD),
+    ejabberd_hooks:delete(disco_sm_features, Host, ?MODULE, get_sm_features, 50),
+    ejabberd_hooks:delete(vcard_iq_set, Host, ?MODULE, vcard_iq_set, 50),
+    Mod = gen_mod:db_mod(Host, ?MODULE),
+    Mod:stop(Host),
+    lists:foreach(
+      fun(MyHost) ->
+	      ejabberd_router:unregister_route(MyHost),
+	      ejabberd_hooks:delete(disco_local_items, MyHost, ?MODULE, disco_items, 100),
+	      ejabberd_hooks:delete(disco_local_features, MyHost, ?MODULE, disco_features, 100),
+	      ejabberd_hooks:delete(disco_local_identity, MyHost, ?MODULE, disco_identity, 100),
+	      gen_iq_handler:remove_iq_handler(ejabberd_local, MyHost, ?NS_SEARCH),
+	      gen_iq_handler:remove_iq_handler(ejabberd_local, MyHost, ?NS_VCARD),
+	      gen_iq_handler:remove_iq_handler(ejabberd_local, MyHost, ?NS_DISCO_ITEMS),
+	      gen_iq_handler:remove_iq_handler(ejabberd_local, MyHost, ?NS_DISCO_INFO)
+      end, MyHosts).
+
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
+
+do_route(#iq{} = IQ) ->
+    ejabberd_router:process_iq(IQ);
+do_route(_) ->
+    ok.
+
+-spec get_sm_features({error, stanza_error()} | empty | {result, [binary()]},
+		      jid(), jid(), binary(), binary()) ->
+			     {error, stanza_error()} | empty | {result, [binary()]}.
 get_sm_features({error, _Error} = Acc, _From, _To,
 		_Node, _Lang) ->
     Acc;
@@ -123,67 +192,125 @@ get_sm_features(Acc, _From, _To, Node, _Lang) ->
       _ -> Acc
     end.
 
-process_local_iq(_From, _To,
-		 #iq{type = Type, lang = Lang, sub_el = SubEl} = IQ) ->
-    case Type of
-      set ->
-	  Txt = <<"Value 'set' of 'type' attribute is not allowed">>,
-	  IQ#iq{type = error, sub_el = [SubEl, ?ERRT_NOT_ALLOWED(Lang, Txt)]};
-      get ->
-	  IQ#iq{type = result,
-		sub_el =
-		    [#xmlel{name = <<"vCard">>,
-			    attrs = [{<<"xmlns">>, ?NS_VCARD}],
-			    children =
-				[#xmlel{name = <<"FN">>, attrs = [],
-					children =
-					    [{xmlcdata, <<"ejabberd">>}]},
-				 #xmlel{name = <<"URL">>, attrs = [],
-					children = [{xmlcdata, ?EJABBERD_URI}]},
-				 #xmlel{name = <<"DESC">>, attrs = [],
-					children =
-					    [{xmlcdata,
-					      <<(translate:translate(Lang,
-								     <<"Erlang Jabber Server">>))/binary,
-						"\nCopyright (c) 2002-2016 ProcessOne">>}]},
-				 #xmlel{name = <<"BDAY">>, attrs = [],
-					children =
-					    [{xmlcdata, <<"2002-11-16">>}]}]}]}
+-spec process_local_iq(iq()) -> iq().
+process_local_iq(#iq{type = set, lang = Lang} = IQ) ->
+    Txt = <<"Value 'set' of 'type' attribute is not allowed">>,
+    xmpp:make_error(IQ, xmpp:err_not_allowed(Txt, Lang));
+process_local_iq(#iq{type = get, lang = Lang} = IQ) ->
+    Desc = translate:translate(Lang, <<"Erlang Jabber Server">>),
+    xmpp:make_iq_result(
+      IQ, #vcard_temp{fn = <<"ejabberd">>,
+		      url = ?EJABBERD_URI,
+		      desc = <<Desc/binary, $\n, ?COPYRIGHT>>,
+		      bday = <<"2002-11-16">>}).
+
+-spec process_sm_iq(iq()) -> iq().
+process_sm_iq(#iq{type = set, lang = Lang, from = From} = IQ) ->
+    #jid{lserver = LServer} = From,
+    case lists:member(LServer, ?MYHOSTS) of
+	true ->
+	    case ejabberd_hooks:run_fold(vcard_iq_set, LServer, IQ, []) of
+		drop -> ignore;
+		#stanza_error{} = Err -> xmpp:make_error(IQ, Err);
+		_ -> xmpp:make_iq_result(IQ)
+	    end;
+	false ->
+	    Txt = <<"The query is only allowed from local users">>,
+	    xmpp:make_error(IQ, xmpp:err_not_allowed(Txt, Lang))
+    end;
+process_sm_iq(#iq{type = get, from = From, to = To, lang = Lang} = IQ) ->
+    #jid{luser = LUser, lserver = LServer} = To,
+    case get_vcard(LUser, LServer) of
+	error ->
+	    Txt = <<"Database failure">>,
+	    xmpp:make_error(IQ, xmpp:err_internal_server_error(Txt, Lang));
+	[] ->
+	    xmpp:make_iq_result(IQ, #vcard_temp{});
+	Els ->
+	    IQ#iq{type = result, to = From, from = To, sub_els = Els}
     end.
 
-process_sm_iq(From, To,
-	      #iq{type = Type, lang = Lang, sub_el = SubEl} = IQ) ->
-    case Type of
-      set ->
-	  #jid{user = User, lserver = LServer} = From,
-	  case lists:member(LServer, ?MYHOSTS) of
-	    true ->
-		set_vcard(User, LServer, SubEl),
-		IQ#iq{type = result, sub_el = []};
-	    false ->
-		Txt = <<"The query is only allowed from local users">>,
-		IQ#iq{type = error, sub_el = [SubEl, ?ERRT_NOT_ALLOWED(Lang, Txt)]}
-	  end;
-      get ->
-	  #jid{luser = LUser, lserver = LServer} = To,
-	  case get_vcard(LUser, LServer) of
-	    error ->
-		Txt = <<"Database failure">>,
-		IQ#iq{type = error,
-		      sub_el = [SubEl, ?ERRT_INTERNAL_SERVER_ERROR(Lang, Txt)]};
-	    [] ->
-		IQ#iq{type = result,
-		      sub_el = [#xmlel{name = <<"vCard">>,
-			        attrs = [{<<"xmlns">>, ?NS_VCARD}],
-			        children = []}]};
-	    Els -> IQ#iq{type = result, sub_el = Els}
-	  end
-    end.
+-spec process_vcard(iq()) -> iq().
+process_vcard(#iq{type = set, lang = Lang} = IQ) ->
+    Txt = <<"Value 'set' of 'type' attribute is not allowed">>,
+    xmpp:make_error(IQ, xmpp:err_not_allowed(Txt, Lang));
+process_vcard(#iq{type = get, lang = Lang} = IQ) ->
+    Desc = translate:translate(Lang, <<"ejabberd vCard module">>),
+    xmpp:make_iq_result(
+      IQ, #vcard_temp{fn = <<"ejabberd/mod_vcard">>,
+		      url = ?EJABBERD_URI,
+		      desc = <<Desc/binary, $\n, ?COPYRIGHT>>}).
 
+-spec process_search(iq()) -> iq().
+process_search(#iq{type = get, to = To, lang = Lang} = IQ) ->
+    ServerHost = ejabberd_router:host_of_route(To#jid.lserver),
+    xmpp:make_iq_result(IQ, mk_search_form(To, ServerHost, Lang));
+process_search(#iq{type = set, to = To, lang = Lang,
+		   sub_els = [#search{xdata = #xdata{type = submit,
+						     fields = Fs}}]} = IQ) ->
+    ServerHost = ejabberd_router:host_of_route(To#jid.lserver),
+    ResultXData = search_result(Lang, To, ServerHost, Fs),
+    xmpp:make_iq_result(IQ, #search{xdata = ResultXData});
+process_search(#iq{type = set, lang = Lang} = IQ) ->
+    Txt = <<"Incorrect data form">>,
+    xmpp:make_error(IQ, xmpp:err_bad_request(Txt, Lang)).
+
+-spec disco_items({error, stanza_error()} | {result, [disco_item()]} | empty,
+		  jid(), jid(), binary(), binary()) ->
+			 {error, stanza_error()} | {result, [disco_item()]}.
+disco_items(empty, _From, _To, <<"">>, _Lang) ->
+    {result, []};
+disco_items(empty, _From, _To, _Node, Lang) ->
+    {error, xmpp:err_item_not_found(<<"No services available">>, Lang)};
+disco_items(Acc, _From, _To, _Node, _Lang) ->
+    Acc.
+
+-spec disco_features({error, stanza_error()} | {result, [binary()]} | empty,
+		     jid(), jid(), binary(), binary()) ->
+			    {error, stanza_error()} | {result, [binary()]}.
+disco_features({error, _Error} = Acc, _From, _To, _Node, _Lang) ->
+    Acc;
+disco_features(Acc, _From, _To, <<"">>, _Lang) ->
+    Features = case Acc of
+		   {result, Fs} -> Fs;
+		   empty -> []
+	       end,
+    {result, [?NS_DISCO_INFO, ?NS_DISCO_ITEMS,
+	      ?NS_VCARD, ?NS_SEARCH | Features]};
+disco_features(empty, _From, _To, _Node, Lang) ->
+    Txt = <<"No features available">>,
+    {error, xmpp:err_item_not_found(Txt, Lang)};
+disco_features(Acc, _From, _To, _Node, _Lang) ->
+    Acc.
+
+-spec disco_identity([identity()], jid(), jid(),
+		     binary(),  binary()) -> [identity()].
+disco_identity(Acc, _From, To, <<"">>, Lang) ->
+    Host = ejabberd_router:host_of_route(To#jid.lserver),
+    Name = gen_mod:get_module_opt(Host, ?MODULE, name),
+    [#identity{category = <<"directory">>,
+	       type = <<"user">>,
+	       name = translate:translate(Lang, Name)}|Acc];
+disco_identity(Acc, _From, _To, _Node, _Lang) ->
+    Acc.
+
+-spec get_vcard(binary(), binary()) -> [xmlel()] | error.
 get_vcard(LUser, LServer) ->
     Mod = gen_mod:db_mod(LServer, ?MODULE),
-    Mod:get_vcard(LUser, LServer).
+    Result = case use_cache(Mod, LServer) of
+		 true ->
+		     ets_cache:lookup(
+		       ?VCARD_CACHE, {LUser, LServer},
+		       fun() -> Mod:get_vcard(LUser, LServer) end);
+		 false ->
+		     Mod:get_vcard(LUser, LServer)
+	     end,
+    case Result of
+	{ok, Els} -> Els;
+	error -> error
+    end.
 
+-spec make_vcard_search(binary(), binary(), binary(), xmlel()) -> #vcard_search{}.
 make_vcard_search(User, LUser, LServer, VCARD) ->
     FN = fxml:get_path_s(VCARD, [{elem, <<"FN">>}, cdata]),
     Family = fxml:get_path_s(VCARD,
@@ -250,349 +377,155 @@ make_vcard_search(User, LUser, LServer, VCARD) ->
 		  orgunit = OrgUnit,
 		  lorgunit = LOrgUnit}.
 
+-spec vcard_iq_set(iq()) -> iq() | {stop, stanza_error()}.
+vcard_iq_set(#iq{from = From, lang = Lang, sub_els = [VCard]} = IQ) ->
+    #jid{user = User, lserver = LServer} = From,
+    case set_vcard(User, LServer, VCard) of
+	{error, badarg} ->
+	    %% Should not be here?
+	    Txt = <<"Nodeprep has failed">>,
+	    {stop, xmpp:err_internal_server_error(Txt, Lang)};
+	ok ->
+	    IQ
+    end;
+vcard_iq_set(Acc) ->
+    Acc.
+
+-spec set_vcard(binary(), binary(), xmlel() | vcard_temp()) -> {error, badarg} | ok.
 set_vcard(User, LServer, VCARD) ->
     case jid:nodeprep(User) of
 	error ->
 	    {error, badarg};
 	LUser ->
-	    VCardSearch = make_vcard_search(User, LUser, LServer, VCARD),
+	    VCardEl = xmpp:encode(VCARD),
+	    VCardSearch = make_vcard_search(User, LUser, LServer, VCardEl),
 	    Mod = gen_mod:db_mod(LServer, ?MODULE),
-	    Mod:set_vcard(LUser, LServer, VCARD, VCardSearch),
-	    ejabberd_hooks:run(vcard_set, LServer,
-			       [LUser, LServer, VCARD])
+	    Mod:set_vcard(LUser, LServer, VCardEl, VCardSearch),
+	    ets_cache:delete(?VCARD_CACHE, {LUser, LServer},
+			     cache_nodes(Mod, LServer)),
+	    ok
     end.
 
+-spec string2lower(binary()) -> binary().
 string2lower(String) ->
     case stringprep:tolower(String) of
       Lower when is_binary(Lower) -> Lower;
       error -> str:to_lower(String)
     end.
 
--define(TLFIELD(Type, Label, Var),
-	#xmlel{name = <<"field">>,
-	       attrs =
-		   [{<<"type">>, Type},
-		    {<<"label">>, translate:translate(Lang, Label)},
-		    {<<"var">>, Var}],
-	       children = []}).
+-spec mk_tfield(binary(), binary(), binary()) -> xdata_field().
+mk_tfield(Label, Var, Lang) ->
+    #xdata_field{type = 'text-single',
+		 label = translate:translate(Lang, Label),
+		 var = Var}.
 
--define(FORM(JID),
-	[#xmlel{name = <<"instructions">>, attrs = [],
-		children =
-		    [{xmlcdata,
-		      translate:translate(Lang,
-					  <<"You need an x:data capable client to "
-					    "search">>)}]},
-	 #xmlel{name = <<"x">>,
-		attrs =
-		    [{<<"xmlns">>, ?NS_XDATA}, {<<"type">>, <<"form">>}],
-		children =
-		    [#xmlel{name = <<"title">>, attrs = [],
-			    children =
-				[{xmlcdata,
-				  <<(translate:translate(Lang,
-							 <<"Search users in ">>))/binary,
-				    (jid:to_string(JID))/binary>>}]},
-		     #xmlel{name = <<"instructions">>, attrs = [],
-			    children =
-				[{xmlcdata,
-				  translate:translate(Lang,
-						      <<"Fill in the form to search for any matching "
-							"Jabber User (Add * to the end of field "
-							"to match substring)">>)}]},
-		     ?TLFIELD(<<"text-single">>, <<"User">>, <<"user">>),
-		     ?TLFIELD(<<"text-single">>, <<"Full Name">>, <<"fn">>),
-		     ?TLFIELD(<<"text-single">>, <<"Name">>, <<"first">>),
-		     ?TLFIELD(<<"text-single">>, <<"Middle Name">>,
-			      <<"middle">>),
-		     ?TLFIELD(<<"text-single">>, <<"Family Name">>,
-			      <<"last">>),
-		     ?TLFIELD(<<"text-single">>, <<"Nickname">>, <<"nick">>),
-		     ?TLFIELD(<<"text-single">>, <<"Birthday">>, <<"bday">>),
-		     ?TLFIELD(<<"text-single">>, <<"Country">>, <<"ctry">>),
-		     ?TLFIELD(<<"text-single">>, <<"City">>, <<"locality">>),
-		     ?TLFIELD(<<"text-single">>, <<"Email">>, <<"email">>),
-		     ?TLFIELD(<<"text-single">>, <<"Organization Name">>,
-			      <<"orgname">>),
-		     ?TLFIELD(<<"text-single">>, <<"Organization Unit">>,
-			      <<"orgunit">>)]}]).
+-spec mk_field(binary(), binary()) -> xdata_field().
+mk_field(Var, Val) ->
+    #xdata_field{var = Var, values = [Val]}.
 
-do_route(ServerHost, From, To, Packet) ->
-    #jid{user = User, resource = Resource} = To,
-    if (User /= <<"">>) or (Resource /= <<"">>) ->
-	   Err = jlib:make_error_reply(Packet,
-				       ?ERR_SERVICE_UNAVAILABLE),
-	   ejabberd_router:route(To, From, Err);
-       true ->
-	   IQ = jlib:iq_query_info(Packet),
-	   case IQ of
-	     #iq{type = Type, xmlns = ?NS_SEARCH, lang = Lang,
-		 sub_el = SubEl} ->
-		 case Type of
-		   set ->
-		       XDataEl = find_xdata_el(SubEl),
-		       case XDataEl of
-			 false ->
-			     Txt = <<"Data form not found">>,
-			     Err = jlib:make_error_reply(
-				     Packet, ?ERRT_BAD_REQUEST(Lang, Txt)),
-			     ejabberd_router:route(To, From, Err);
-			 _ ->
-			     XData = jlib:parse_xdata_submit(XDataEl),
-			     case XData of
-			       invalid ->
-				   Txt = <<"Incorrect data form">>,
-				   Err = jlib:make_error_reply(
-					   Packet, ?ERRT_BAD_REQUEST(Lang, Txt)),
-				   ejabberd_router:route(To, From, Err);
-			       _ ->
-				   ResIQ = IQ#iq{type = result,
-						 sub_el =
-						     [#xmlel{name = <<"query">>,
-							     attrs =
-								 [{<<"xmlns">>,
-								   ?NS_SEARCH}],
-							     children =
-								 [#xmlel{name =
-									     <<"x">>,
-									 attrs =
-									     [{<<"xmlns">>,
-									       ?NS_XDATA},
-									      {<<"type">>,
-									       <<"result">>}],
-									 children
-									     =
-									     search_result(Lang,
-											   To,
-											   ServerHost,
-											   XData)}]}]},
-				   ejabberd_router:route(To, From,
-							 jlib:iq_to_xml(ResIQ))
-			     end
-		       end;
-		   get ->
-		       ResIQ = IQ#iq{type = result,
-				     sub_el =
-					 [#xmlel{name = <<"query">>,
-						 attrs =
-						     [{<<"xmlns">>,
-						       ?NS_SEARCH}],
-						 children = ?FORM(To)}]},
-		       ejabberd_router:route(To, From, jlib:iq_to_xml(ResIQ))
-		 end;
-	     #iq{type = Type, xmlns = ?NS_DISCO_INFO, lang = Lang} ->
-		 case Type of
-		   set ->
-		       Txt = <<"Value 'set' of 'type' attribute is not allowed">>,
-		       Err = jlib:make_error_reply(Packet, ?ERRT_NOT_ALLOWED(Lang, Txt)),
-		       ejabberd_router:route(To, From, Err);
-		   get ->
-		       Info = ejabberd_hooks:run_fold(disco_info, ServerHost,
-						      [],
-						      [ServerHost, ?MODULE,
-						       <<"">>, <<"">>]),
-		       ResIQ = IQ#iq{type = result,
-				     sub_el =
-					 [#xmlel{name = <<"query">>,
-						 attrs =
-						     [{<<"xmlns">>,
-						       ?NS_DISCO_INFO}],
-						 children =
-						     [#xmlel{name =
-								 <<"identity">>,
-							     attrs =
-								 [{<<"category">>,
-								   <<"directory">>},
-								  {<<"type">>,
-								   <<"user">>},
-								  {<<"name">>,
-								   translate:translate(Lang,
-										       <<"vCard User Search">>)}],
-							     children = []},
-						      #xmlel{name =
-								 <<"feature">>,
-							     attrs =
-								 [{<<"var">>,
-								   ?NS_DISCO_INFO}],
-							     children = []},
-						      #xmlel{name =
-								 <<"feature">>,
-							     attrs =
-								 [{<<"var">>,
-								   ?NS_SEARCH}],
-							     children = []},
-						      #xmlel{name =
-								 <<"feature">>,
-							     attrs =
-								 [{<<"var">>,
-								   ?NS_VCARD}],
-							     children = []}]
-						       ++ Info}]},
-		       ejabberd_router:route(To, From, jlib:iq_to_xml(ResIQ))
-		 end;
-	     #iq{type = Type, lang = Lang, xmlns = ?NS_DISCO_ITEMS} ->
-		 case Type of
-		   set ->
-		       Txt = <<"Value 'set' of 'type' attribute is not allowed">>,
-		       Err = jlib:make_error_reply(Packet, ?ERRT_NOT_ALLOWED(Lang, Txt)),
-		       ejabberd_router:route(To, From, Err);
-		   get ->
-		       ResIQ = IQ#iq{type = result,
-				     sub_el =
-					 [#xmlel{name = <<"query">>,
-						 attrs =
-						     [{<<"xmlns">>,
-						       ?NS_DISCO_ITEMS}],
-						 children = []}]},
-		       ejabberd_router:route(To, From, jlib:iq_to_xml(ResIQ))
-		 end;
-	     #iq{type = get, xmlns = ?NS_VCARD, lang = Lang} ->
-		 ResIQ = IQ#iq{type = result,
-			       sub_el =
-				   [#xmlel{name = <<"vCard">>,
-					   attrs = [{<<"xmlns">>, ?NS_VCARD}],
-					   children = iq_get_vcard(Lang)}]},
-		 ejabberd_router:route(To, From, jlib:iq_to_xml(ResIQ));
-	     _ ->
-		 Err = jlib:make_error_reply(Packet,
-					     ?ERR_SERVICE_UNAVAILABLE),
-		 ejabberd_router:route(To, From, Err)
-	   end
-    end.
+-spec mk_search_form(jid(), binary(), binary()) -> search().
+mk_search_form(JID, ServerHost, Lang) ->
+    Title = <<(translate:translate(Lang, <<"Search users in ">>))/binary,
+	      (jid:encode(JID))/binary>>,
+    Mod = gen_mod:db_mod(ServerHost, ?MODULE),
+    SearchFields = Mod:search_fields(ServerHost),
+    Fs = [mk_tfield(Label, Var, Lang) || {Label, Var} <- SearchFields],
+    X = #xdata{type = form,
+	       title = Title,
+	       instructions =
+		   [translate:translate(
+		      Lang,
+		      <<"Fill in the form to search for any matching "
+			"Jabber User (Add * to the end of field "
+			"to match substring)">>)],
+	       fields = Fs},
+    #search{instructions =
+		translate:translate(
+		  Lang, <<"You need an x:data capable client to search">>),
+	    xdata = X}.
 
-iq_get_vcard(Lang) ->
-    [#xmlel{name = <<"FN">>, attrs = [],
-	    children = [{xmlcdata, <<"ejabberd/mod_vcard">>}]},
-     #xmlel{name = <<"URL">>, attrs = [],
-	    children = [{xmlcdata, ?EJABBERD_URI}]},
-     #xmlel{name = <<"DESC">>, attrs = [],
-	    children =
-		[{xmlcdata,
-		  <<(translate:translate(Lang,
-					 <<"ejabberd vCard module">>))/binary,
-		    "\nCopyright (c) 2003-2016 ProcessOne">>}]}].
+-spec search_result(binary(), jid(), binary(), [xdata_field()]) -> xdata().
+search_result(Lang, JID, ServerHost, XFields) ->
+    Mod = gen_mod:db_mod(ServerHost, ?MODULE),
+    Reported = [mk_tfield(Label, Var, Lang) ||
+		   {Label, Var} <- Mod:search_reported(ServerHost)],
+    #xdata{type = result,
+	   title = <<(translate:translate(Lang,
+					  <<"Search Results for ">>))/binary,
+		     (jid:encode(JID))/binary>>,
+	   reported = Reported,
+	   items = lists:map(fun (Item) -> item_to_field(Item) end,
+			     search(ServerHost, XFields))}.
 
-find_xdata_el(#xmlel{children = SubEls}) ->
-    find_xdata_el1(SubEls).
+-spec item_to_field([{binary(), binary()}]) -> [xdata_field()].
+item_to_field(Items) ->
+    [mk_field(Var, Value) || {Var, Value} <- Items].
 
-find_xdata_el1([]) -> false;
-find_xdata_el1([#xmlel{name = Name, attrs = Attrs,
-		       children = SubEls}
-		| Els]) ->
-    case fxml:get_attr_s(<<"xmlns">>, Attrs) of
-      ?NS_XDATA ->
-	  #xmlel{name = Name, attrs = Attrs, children = SubEls};
-      _ -> find_xdata_el1(Els)
-    end;
-find_xdata_el1([_ | Els]) -> find_xdata_el1(Els).
-
--define(LFIELD(Label, Var),
-	#xmlel{name = <<"field">>,
-	       attrs =
-		   [{<<"label">>, translate:translate(Lang, Label)},
-		    {<<"var">>, Var}],
-	       children = []}).
-
-search_result(Lang, JID, ServerHost, Data) ->
-    [#xmlel{name = <<"title">>, attrs = [],
-	    children =
-		[{xmlcdata,
-		  <<(translate:translate(Lang,
-					 <<"Search Results for ">>))/binary,
-		    (jid:to_string(JID))/binary>>}]},
-     #xmlel{name = <<"reported">>, attrs = [],
-	    children =
-		[?TLFIELD(<<"text-single">>, <<"Jabber ID">>,
-			  <<"jid">>),
-		 ?TLFIELD(<<"text-single">>, <<"Full Name">>, <<"fn">>),
-		 ?TLFIELD(<<"text-single">>, <<"Name">>, <<"first">>),
-		 ?TLFIELD(<<"text-single">>, <<"Middle Name">>,
-			  <<"middle">>),
-		 ?TLFIELD(<<"text-single">>, <<"Family Name">>,
-			  <<"last">>),
-		 ?TLFIELD(<<"text-single">>, <<"Nickname">>, <<"nick">>),
-		 ?TLFIELD(<<"text-single">>, <<"Birthday">>, <<"bday">>),
-		 ?TLFIELD(<<"text-single">>, <<"Country">>, <<"ctry">>),
-		 ?TLFIELD(<<"text-single">>, <<"City">>, <<"locality">>),
-		 ?TLFIELD(<<"text-single">>, <<"Email">>, <<"email">>),
-		 ?TLFIELD(<<"text-single">>, <<"Organization Name">>,
-			  <<"orgname">>),
-		 ?TLFIELD(<<"text-single">>, <<"Organization Unit">>,
-			  <<"orgunit">>)]}]
-      ++
-      lists:map(fun (R) -> record_to_item(ServerHost, R) end,
-		search(ServerHost, Data)).
-
--define(FIELD(Var, Val),
-	#xmlel{name = <<"field">>, attrs = [{<<"var">>, Var}],
-	       children =
-		   [#xmlel{name = <<"value">>, attrs = [],
-			   children = [{xmlcdata, Val}]}]}).
-
-record_to_item(LServer,
-	       [Username, FN, Family, Given, Middle, Nickname, BDay,
-		CTRY, Locality, EMail, OrgName, OrgUnit]) ->
-    #xmlel{name = <<"item">>, attrs = [],
-	   children =
-	       [?FIELD(<<"jid">>,
-		       <<Username/binary, "@", LServer/binary>>),
-		?FIELD(<<"fn">>, FN), ?FIELD(<<"last">>, Family),
-		?FIELD(<<"first">>, Given),
-		?FIELD(<<"middle">>, Middle),
-		?FIELD(<<"nick">>, Nickname), ?FIELD(<<"bday">>, BDay),
-		?FIELD(<<"ctry">>, CTRY),
-		?FIELD(<<"locality">>, Locality),
-		?FIELD(<<"email">>, EMail),
-		?FIELD(<<"orgname">>, OrgName),
-		?FIELD(<<"orgunit">>, OrgUnit)]};
-record_to_item(_LServer, #vcard_search{} = R) ->
-    {User, Server} = R#vcard_search.user,
-    #xmlel{name = <<"item">>, attrs = [],
-	   children =
-	       [?FIELD(<<"jid">>, <<User/binary, "@", Server/binary>>),
-		?FIELD(<<"fn">>, (R#vcard_search.fn)),
-		?FIELD(<<"last">>, (R#vcard_search.family)),
-		?FIELD(<<"first">>, (R#vcard_search.given)),
-		?FIELD(<<"middle">>, (R#vcard_search.middle)),
-		?FIELD(<<"nick">>, (R#vcard_search.nickname)),
-		?FIELD(<<"bday">>, (R#vcard_search.bday)),
-		?FIELD(<<"ctry">>, (R#vcard_search.ctry)),
-		?FIELD(<<"locality">>, (R#vcard_search.locality)),
-		?FIELD(<<"email">>, (R#vcard_search.email)),
-		?FIELD(<<"orgname">>, (R#vcard_search.orgname)),
-		?FIELD(<<"orgunit">>, (R#vcard_search.orgunit))]}.
-
-search(LServer, Data) ->
+-spec search(binary(), [xdata_field()]) -> [binary()].
+search(LServer, XFields) ->
+    Data = [{Var, Vals} || #xdata_field{var = Var, values = Vals} <- XFields],
     Mod = gen_mod:db_mod(LServer, ?MODULE),
-    AllowReturnAll = gen_mod:get_module_opt(LServer, ?MODULE, allow_return_all,
-                                            fun(B) when is_boolean(B) -> B end,
-                                            false),
-    MaxMatch = gen_mod:get_module_opt(LServer, ?MODULE, matches,
-				      fun(infinity) -> infinity;
-					 (I) when is_integer(I),
-						  I>0 ->
-					      I
-				      end, ?JUD_MATCHES),
+    AllowReturnAll = gen_mod:get_module_opt(LServer, ?MODULE, allow_return_all),
+    MaxMatch = gen_mod:get_module_opt(LServer, ?MODULE, matches),
     Mod:search(LServer, Data, AllowReturnAll, MaxMatch).
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+-spec remove_user(binary(), binary()) -> ok.
 remove_user(User, Server) ->
     LUser = jid:nodeprep(User),
     LServer = jid:nameprep(Server),
     Mod = gen_mod:db_mod(LServer, ?MODULE),
-    Mod:remove_user(LUser, LServer).
+    Mod:remove_user(LUser, LServer),
+    ets_cache:delete(?VCARD_CACHE, {LUser, LServer}, cache_nodes(Mod, LServer)).
+
+-spec init_cache(module(), binary(), gen_mod:opts()) -> ok.
+init_cache(Mod, Host, Opts) ->
+    case use_cache(Mod, Host) of
+	true ->
+	    CacheOpts = cache_opts(Host, Opts),
+	    ets_cache:new(?VCARD_CACHE, CacheOpts);
+	false ->
+	    ets_cache:delete(?VCARD_CACHE)
+    end.
+
+-spec cache_opts(binary(), gen_mod:opts()) -> [proplists:property()].
+cache_opts(_Host, Opts) ->
+    MaxSize = gen_mod:get_opt(cache_size, Opts),
+    CacheMissed = gen_mod:get_opt(cache_missed, Opts),
+    LifeTime = case gen_mod:get_opt(cache_life_time, Opts) of
+		   infinity -> infinity;
+		   I -> timer:seconds(I)
+	       end,
+    [{max_size, MaxSize}, {cache_missed, CacheMissed}, {life_time, LifeTime}].
+
+-spec use_cache(module(), binary()) -> boolean().
+use_cache(Mod, Host) ->
+    case erlang:function_exported(Mod, use_cache, 1) of
+	true -> Mod:use_cache(Host);
+	false -> gen_mod:get_module_opt(Host, ?MODULE, use_cache)
+    end.
+
+-spec cache_nodes(module(), binary()) -> [node()].
+cache_nodes(Mod, Host) ->
+    case erlang:function_exported(Mod, cache_nodes, 1) of
+	true -> Mod:cache_nodes(Host);
+	false -> ejabberd_cluster:get_nodes()
+    end.
+
+import_info() ->
+    [{<<"vcard">>, 3}, {<<"vcard_search">>, 24}].
+
+import_start(LServer, DBType) ->
+    Mod = gen_mod:db_mod(DBType, ?MODULE),
+    Mod:init(LServer, []).
+
+import(LServer, {sql, _}, DBType, Tab, L) ->
+    Mod = gen_mod:db_mod(DBType, ?MODULE),
+    Mod:import(LServer, Tab, L).
 
 export(LServer) ->
     Mod = gen_mod:db_mod(LServer, ?MODULE),
     Mod:export(LServer).
-
-import(LServer) ->
-    Mod = gen_mod:db_mod(LServer, ?MODULE),
-    Mod:import(LServer).
-
-import(LServer, DBType, VCard) ->
-    Mod = gen_mod:db_mod(DBType, ?MODULE),
-    Mod:import(LServer, VCard).
 
 depends(_Host, _Opts) ->
     [].
@@ -600,16 +533,32 @@ depends(_Host, _Opts) ->
 mod_opt_type(allow_return_all) ->
     fun (B) when is_boolean(B) -> B end;
 mod_opt_type(db_type) -> fun(T) -> ejabberd_config:v_db(?MODULE, T) end;
+mod_opt_type(name) -> fun iolist_to_binary/1;
 mod_opt_type(host) -> fun iolist_to_binary/1;
-mod_opt_type(iqdisc) -> fun gen_iq_handler:check_type/1;
+mod_opt_type(hosts) ->
+    fun (L) -> lists:map(fun iolist_to_binary/1, L) end;
 mod_opt_type(matches) ->
     fun (infinity) -> infinity;
 	(I) when is_integer(I), I > 0 -> I
     end;
 mod_opt_type(search) ->
     fun (B) when is_boolean(B) -> B end;
-mod_opt_type(search_all_hosts) ->
-    fun (B) when is_boolean(B) -> B end;
-mod_opt_type(_) ->
-    [allow_return_all, db_type, host, iqdisc, matches,
-     search, search_all_hosts].
+mod_opt_type(O) when O == cache_life_time; O == cache_size ->
+    fun (I) when is_integer(I), I > 0 -> I;
+        (infinity) -> infinity
+    end;
+mod_opt_type(O) when O == use_cache; O == cache_missed ->
+    fun (B) when is_boolean(B) -> B end.
+
+mod_options(Host) ->
+    [{allow_return_all, false},
+     {host, <<"vjud.@HOST@">>},
+     {hosts, []},
+     {matches, 30},
+     {search, false},
+     {name, ?T("vCard User Search")},
+     {db_type, ejabberd_config:default_db(Host, ?MODULE)},
+     {use_cache, ejabberd_config:use_cache(Host)},
+     {cache_size, ejabberd_config:cache_size(Host)},
+     {cache_missed, ejabberd_config:cache_missed(Host)},
+     {cache_life_time, ejabberd_config:cache_life_time(Host)}].

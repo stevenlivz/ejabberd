@@ -5,7 +5,7 @@
 %%% Created : 11 Jan 2004 by Alexey Shchepin <alexey@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2016   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -46,11 +46,15 @@
 -module(ejabberd_ctl).
 
 -behaviour(ejabberd_config).
+-behaviour(gen_server).
 -author('alexey@process-one.net').
 
--export([start/0, init/0, process/1, process2/2,
+-export([start/0, start_link/0, process/1, process2/2,
 	 register_commands/3, unregister_commands/3,
 	 opt_type/1]).
+%% gen_server callbacks
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2,
+	 terminate/2, code_change/3]).
 
 -include("ejabberd_ctl.hrl").
 -include("ejabberd_commands.hrl").
@@ -59,6 +63,7 @@
 
 -define(DEFAULT_VERSION, 1000000).
 
+-record(state, {}).
 
 %%-----------------------------
 %% Module
@@ -103,13 +108,32 @@ start() ->
              end,
     halt(Status).
 
-init() ->
-    ets:new(ejabberd_ctl_cmds, [named_table, set, public]),
-    ets:new(ejabberd_ctl_host_cmds, [named_table, set, public]).
+start_link() ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
+init([]) ->
+    ets:new(ejabberd_ctl_cmds, [named_table, set, public]),
+    ets:new(ejabberd_ctl_host_cmds, [named_table, set, public]),
+    {ok, #state{}}.
+
+handle_call(_Request, _From, State) ->
+    Reply = ok,
+    {reply, Reply, State}.
+
+handle_cast(_Msg, State) ->
+    {noreply, State}.
+
+handle_info(_Info, State) ->
+    {noreply, State}.
+
+terminate(_Reason, _State) ->
+    ok.
+
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
 
 %%-----------------------------
-%% ejabberdctl Command managment
+%% ejabberdctl Command management
 %%-----------------------------
 
 register_commands(CmdDescs, Module, Function) ->
@@ -265,8 +289,7 @@ process2(Args, AccessCommands, Auth, Version) ->
     end.
 
 get_accesscommands() ->
-    ejabberd_config:get_option(ejabberdctl_access_commands,
-                                     fun(V) when is_list(V) -> V end, []).
+    ejabberd_config:get_option(ejabberdctl_access_commands, []).
 
 %%-----------------------------
 %% Command calling
@@ -311,7 +334,7 @@ try_call_command(Args, Auth, AccessCommands, Version) ->
     end.
 
 %% @spec (Args::[string()], Auth, AccessCommands) -> string() | integer() | {string(), integer()} | {error, ErrorType}
-call_command([CmdString | Args], Auth, AccessCommands, Version) ->
+call_command([CmdString | Args], Auth, _AccessCommands, Version) ->
     CmdStringU = ejabberd_regexp:greplace(
                    list_to_binary(CmdString), <<"-">>, <<"_">>),
     Command = list_to_atom(binary_to_list(CmdStringU)),
@@ -321,10 +344,15 @@ call_command([CmdString | Args], Auth, AccessCommands, Version) ->
 	{ArgsFormat, ResultFormat} ->
 	    case (catch format_args(Args, ArgsFormat)) of
 		ArgsFormatted when is_list(ArgsFormatted) ->
-		    Result = ejabberd_commands:execute_command(AccessCommands,
-							       Auth, Command,
-							       ArgsFormatted,
-							       Version),
+		    CI = case Auth of
+			     {U, S, _, _} -> #{usr => {U, S, <<"">>}, caller_host => S};
+			     _ -> #{}
+			 end,
+		    CI2 = CI#{caller_module => ?MODULE},
+		    Result = ejabberd_commands:execute_command2(Command,
+								ArgsFormatted,
+								CI2,
+								Version),
 		    format_result(Result, ResultFormat);
 		{'EXIT', {function_clause,[{lists,zip,[A1, A2], _} | _]}} ->
 		    {NumCompa, TextCompa} =
@@ -838,7 +866,7 @@ print(Format, Args) ->
     io:format(lists:flatten(Format), Args).
 
 %%-----------------------------
-%% Command managment
+%% Command management
 %%-----------------------------
 
 %%+++
@@ -847,6 +875,8 @@ print(Format, Args) ->
 %%    ["aaaa bbb ccc"].
 
 
+-spec opt_type(ejabberdctl_access_commands) -> fun((list()) -> list());
+	      (atom()) -> [atom()].
 opt_type(ejabberdctl_access_commands) ->
     fun (V) when is_list(V) -> V end;
 opt_type(_) -> [ejabberdctl_access_commands].

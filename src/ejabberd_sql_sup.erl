@@ -5,7 +5,7 @@
 %%% Created : 22 Dec 2004 by Alexey Shchepin <alexey@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2016   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -49,11 +49,10 @@
 -record(sql_pool, {host, pid}).
 
 start_link(Host) ->
-    mnesia:create_table(sql_pool,
+    ejabberd_mnesia:create(?MODULE, sql_pool,
 			[{ram_copies, [node()]}, {type, bag},
 			 {local_content, true},
 			 {attributes, record_info(fields, sql_pool)}]),
-    mnesia:add_table_copy(sql_pool, node(), ram_copies),
     F = fun () -> mnesia:delete({sql_pool, Host}) end,
     mnesia:ets(F),
     supervisor:start_link({local,
@@ -61,21 +60,11 @@ start_link(Host) ->
 			  ?MODULE, [Host]).
 
 init([Host]) ->
-    PoolSize = ejabberd_config:get_option(
-                 {sql_pool_size, Host},
-                 fun(I) when is_integer(I), I>0 -> I end,
-                 ?DEFAULT_POOL_SIZE),
     StartInterval = ejabberd_config:get_option(
                       {sql_start_interval, Host},
-                      fun(I) when is_integer(I), I>0 -> I end,
                       ?DEFAULT_SQL_START_INTERVAL),
-    Type = ejabberd_config:get_option({sql_type, Host},
-                                      fun(mysql) -> mysql;
-                                         (pgsql) -> pgsql;
-                                         (sqlite) -> sqlite;
-					 (mssql) -> mssql;
-                                         (odbc) -> odbc
-                                      end, odbc),
+    Type = ejabberd_config:get_option({sql_type, Host}, odbc),
+    PoolSize = get_pool_size(Type, Host),
     case Type of
         sqlite ->
             check_sqlite_db(Host);
@@ -97,12 +86,14 @@ init([Host]) ->
 
 get_pids(Host) ->
     Rs = mnesia:dirty_read(sql_pool, Host),
-    [R#sql_pool.pid || R <- Rs].
+    [R#sql_pool.pid || R <- Rs, is_process_alive(R#sql_pool.pid)].
 
 get_random_pid(Host) ->
     case get_pids(Host) of
       [] -> none;
-      Pids -> lists:nth(erlang:phash(p1_time_compat:unique_integer(), length(Pids)), Pids)
+      Pids ->
+	    I = randoms:round_robin(length(Pids)) + 1,
+	    lists:nth(I, Pids)
     end.
 
 add_pid(Host, Pid) ->
@@ -116,6 +107,22 @@ remove_pid(Host, Pid) ->
 		mnesia:delete_object(#sql_pool{host = Host, pid = Pid})
 	end,
     mnesia:ets(F).
+
+-spec get_pool_size(atom(), binary()) -> pos_integer().
+get_pool_size(SQLType, Host) ->
+    PoolSize = ejabberd_config:get_option(
+                 {sql_pool_size, Host},
+		 case SQLType of
+		     sqlite -> 1;
+		     _ -> ?DEFAULT_POOL_SIZE
+		 end),
+    if PoolSize > 1 andalso SQLType == sqlite ->
+	    ?WARNING_MSG("it's not recommended to set sql_pool_size > 1 for "
+			 "sqlite, because it may cause race conditions", []);
+       true ->
+	    ok
+    end,
+    PoolSize.
 
 transform_options(Opts) ->
     lists:foldl(fun transform_options/2, [], Opts).
@@ -211,16 +218,12 @@ read_lines(Fd, File, Acc) ->
             []
     end.
 
+-spec opt_type(sql_pool_size) -> fun((pos_integer()) -> pos_integer());
+	      (sql_start_interval) -> fun((pos_integer()) -> pos_integer());
+	      (atom()) -> [atom()].
 opt_type(sql_pool_size) ->
     fun (I) when is_integer(I), I > 0 -> I end;
 opt_type(sql_start_interval) ->
     fun (I) when is_integer(I), I > 0 -> I end;
-opt_type(sql_type) ->
-    fun (mysql) -> mysql;
-	(pgsql) -> pgsql;
-	(sqlite) -> sqlite;
-	(mssql) -> mssql;
-	(odbc) -> odbc
-    end;
 opt_type(_) ->
-    [sql_pool_size, sql_start_interval, sql_type].
+    [sql_pool_size, sql_start_interval].

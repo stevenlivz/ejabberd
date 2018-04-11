@@ -1,24 +1,42 @@
 %%%-------------------------------------------------------------------
-%%% @author Evgeny Khramtsov <ekhramtsov@process-one.net>
-%%% @copyright (C) 2016, Evgeny Khramtsov
-%%% @doc
-%%%
-%%% @end
+%%% File    : mod_announce_sql.erl
+%%% Author  : Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%% Created : 13 Apr 2016 by Evgeny Khramtsov <ekhramtsov@process-one.net>
-%%%-------------------------------------------------------------------
+%%%
+%%%
+%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
+%%%
+%%% This program is free software; you can redistribute it and/or
+%%% modify it under the terms of the GNU General Public License as
+%%% published by the Free Software Foundation; either version 2 of the
+%%% License, or (at your option) any later version.
+%%%
+%%% This program is distributed in the hope that it will be useful,
+%%% but WITHOUT ANY WARRANTY; without even the implied warranty of
+%%% MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+%%% General Public License for more details.
+%%%
+%%% You should have received a copy of the GNU General Public License along
+%%% with this program; if not, write to the Free Software Foundation, Inc.,
+%%% 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+%%%
+%%%----------------------------------------------------------------------
+
 -module(mod_announce_sql).
+
 -behaviour(mod_announce).
 
 -compile([{parse_transform, ejabberd_sql_pt}]).
 
 %% API
 -export([init/2, set_motd_users/2, set_motd/2, delete_motd/1,
-	 get_motd/1, is_motd_user/2, set_motd_user/2, import/1,
-	 import/2, export/1]).
+	 get_motd/1, is_motd_user/2, set_motd_user/2, import/3,
+	 export/1]).
 
--include("jlib.hrl").
+-include("xmpp.hrl").
 -include("mod_announce.hrl").
 -include("ejabberd_sql_pt.hrl").
+-include("logger.hrl").
 
 %%%===================================================================
 %%% API
@@ -33,10 +51,11 @@ set_motd_users(LServer, USRs) ->
                           ?SQL_UPSERT_T(
                              "motd",
                              ["!username=%(U)s",
+                              "!server_host=%(LServer)s",
                               "xml=''"])
 		  end, USRs)
 	end,
-    ejabberd_sql:sql_transaction(LServer, F).
+    transaction(LServer, F).
 
 set_motd(LServer, Packet) ->
     XML = fxml:element_to_binary(Packet),
@@ -44,40 +63,42 @@ set_motd(LServer, Packet) ->
                 ?SQL_UPSERT_T(
                    "motd",
                    ["!username=''",
+                    "!server_host=%(LServer)s",
                     "xml=%(XML)s"])
 	end,
-    ejabberd_sql:sql_transaction(LServer, F).
+    transaction(LServer, F).
 
 delete_motd(LServer) ->
     F = fun() ->
-                ejabberd_sql:sql_query_t(?SQL("delete from motd"))
+                ejabberd_sql:sql_query_t(
+                  ?SQL("delete from motd where %(LServer)H"))
 	end,
-    ejabberd_sql:sql_transaction(LServer, F).
+    transaction(LServer, F).
 
 get_motd(LServer) ->
     case catch ejabberd_sql:sql_query(
                  LServer,
-                 ?SQL("select @(xml)s from motd where username=''")) of
+                 ?SQL("select @(xml)s from motd"
+                      " where username='' and %(LServer)H")) of
         {selected, [{XML}]} ->
-            case fxml_stream:parse_element(XML) of
-                {error, _} ->
-                    error;
-                Packet ->
-		    {ok, Packet}
-	    end;
+	    parse_element(XML);
+	{selected, []} ->
+	    error;
 	_ ->
-	    error
+	    {error, db_failure}
     end.
 
 is_motd_user(LUser, LServer) ->
     case catch ejabberd_sql:sql_query(
                  LServer,
                  ?SQL("select @(username)s from motd"
-                      " where username=%(LUser)s")) of
+                      " where username=%(LUser)s and %(LServer)H")) of
         {selected, [_|_]} ->
-	    true;
+	    {ok, true};
+	{selected, []} ->
+	    {ok, false};
 	_ ->
-	    false
+	    {error, db_failure}
     end.
 
 set_motd_user(LUser, LServer) ->
@@ -85,43 +106,56 @@ set_motd_user(LUser, LServer) ->
                 ?SQL_UPSERT_T(
                    "motd",
                    ["!username=%(LUser)s",
+                    "!server_host=%(LServer)s",
                     "xml=''"])
         end,
-    ejabberd_sql:sql_transaction(LServer, F).
+    transaction(LServer, F).
 
 export(_Server) ->
     [{motd,
       fun(Host, #motd{server = LServer, packet = El})
             when LServer == Host ->
               XML = fxml:element_to_binary(El),
-              [?SQL("delete from motd where username='';"),
-               ?SQL("insert into motd(username, xml) values ('', %(XML)s);")];
+              [?SQL("delete from motd where username='' and %(LServer)H;"),
+               ?SQL_INSERT(
+                  "motd",
+                  ["username=''",
+                   "server_host=%(LServer)s",
+                   "xml=%(XML)s"])];
          (_Host, _R) ->
               []
       end},
      {motd_users,
       fun(Host, #motd_users{us = {LUser, LServer}})
             when LServer == Host, LUser /= <<"">> ->
-              [?SQL("delete from motd where username=%(LUser)s;"),
-               ?SQL("insert into motd(username, xml) values (%(LUser)s, '');")];
+              [?SQL("delete from motd where username=%(LUser)s and %(LServer)H;"),
+               ?SQL_INSERT(
+                  "motd",
+                  ["username=%(LUser)s",
+                   "server_host=%(LServer)s",
+                   "xml=''"])];
          (_Host, _R) ->
               []
       end}].
 
-import(LServer) ->
-    [{<<"select xml from motd where username='';">>,
-      fun([XML]) ->
-              El = fxml_stream:parse_element(XML),
-              #motd{server = LServer, packet = El}
-      end},
-     {<<"select username from motd where xml='';">>,
-      fun([LUser]) ->
-              #motd_users{us = {LUser, LServer}}
-      end}].
-
-import(_, _) ->
-    pass.
+import(_, _, _) ->
+    ok.
 
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+transaction(LServer, F) ->
+    case ejabberd_sql:sql_transaction(LServer, F) of
+	{atomic, _} -> ok;
+	_ -> {error, db_failure}
+    end.
+
+parse_element(XML) ->
+    case fxml_stream:parse_element(XML) of
+        El when is_record(El, xmlel) ->
+            {ok, El};
+        _ ->
+            ?ERROR_MSG("malformed XML element in SQL table "
+                       "'motd' for username='': ~s", [XML]),
+            {error, db_failure}
+    end.

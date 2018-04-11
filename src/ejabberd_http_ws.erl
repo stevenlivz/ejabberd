@@ -5,7 +5,7 @@
 %%% Created : 09-10-2010 by Eric Cestari <ecestari@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2016   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -28,18 +28,19 @@
 
 -author('ecestari@process-one.net').
 
--behaviour(gen_fsm).
+-behaviour(p1_fsm).
 
 -export([start/1, start_link/1, init/1, handle_event/3,
 	 handle_sync_event/4, code_change/4, handle_info/3,
 	 terminate/3, send_xml/2, setopts/2, sockname/1,
 	 peername/1, controlling_process/2, become_controller/2,
-	 close/1, socket_handoff/6, opt_type/1]).
+	 monitor/1, reset_stream/1, close/1, change_shaper/2,
+	 socket_handoff/6, opt_type/1]).
 
 -include("ejabberd.hrl").
 -include("logger.hrl").
 
--include("jlib.hrl").
+-include("xmpp.hrl").
 
 -include("ejabberd_http.hrl").
 
@@ -50,12 +51,12 @@
         {socket                       :: ws_socket(),
          ping_interval = ?PING_INTERVAL :: non_neg_integer(),
          ping_timer = make_ref()      :: reference(),
-         pong_expected                :: boolean(),
+         pong_expected = false        :: boolean(),
          timeout = ?WEBSOCKET_TIMEOUT :: non_neg_integer(),
          timer = make_ref()           :: reference(),
          input = []                   :: list(),
          waiting_input = false        :: false | pid(),
-         last_receiver                :: pid(),
+         last_receiver = self()       :: pid(),
          ws                           :: {#ws{}, pid()},
          rfc_compilant = undefined    :: boolean() | undefined}).
 
@@ -75,19 +76,25 @@
 -export_type([ws_socket/0]).
 
 start(WS) ->
-    gen_fsm:start(?MODULE, [WS], ?FSMOPTS).
+    p1_fsm:start(?MODULE, [WS], ?FSMOPTS).
 
 start_link(WS) ->
-    gen_fsm:start_link(?MODULE, [WS], ?FSMOPTS).
+    p1_fsm:start_link(?MODULE, [WS], ?FSMOPTS).
 
 send_xml({http_ws, FsmRef, _IP}, Packet) ->
-    gen_fsm:sync_send_all_state_event(FsmRef,
-				      {send_xml, Packet}).
+    case catch p1_fsm:sync_send_all_state_event(FsmRef,
+						    {send_xml, Packet},
+						    15000)
+    of
+	{'EXIT', {timeout, _}} -> {error, timeout};
+	{'EXIT', _} -> {error, einval};
+	Res -> Res
+    end.
 
 setopts({http_ws, FsmRef, _IP}, Opts) ->
     case lists:member({active, once}, Opts) of
       true ->
-	  gen_fsm:send_all_state_event(FsmRef,
+	  p1_fsm:send_all_state_event(FsmRef,
 				       {activate, self()});
       _ -> ok
     end.
@@ -99,11 +106,20 @@ peername({http_ws, _FsmRef, IP}) -> {ok, IP}.
 controlling_process(_Socket, _Pid) -> ok.
 
 become_controller(FsmRef, C2SPid) ->
-    gen_fsm:send_all_state_event(FsmRef,
-				 {become_controller, C2SPid}).
+    p1_fsm:send_all_state_event(FsmRef, {activate, C2SPid}).
 
 close({http_ws, FsmRef, _IP}) ->
-    catch gen_fsm:sync_send_all_state_event(FsmRef, close).
+    catch p1_fsm:sync_send_all_state_event(FsmRef, close).
+
+monitor({http_ws, FsmRef, _IP}) ->
+    erlang:monitor(process, FsmRef).
+
+reset_stream({http_ws, _FsmRef, _IP} = Socket) ->
+    Socket.
+
+change_shaper({http_ws, _FsmRef, _IP}, _Shaper) ->
+    %% TODO???
+    ok.
 
 socket_handoff(LocalPath, Request, Socket, SockMod, Buf, Opts) ->
     ejabberd_websocket:socket_handoff(LocalPath, Request, Socket, SockMod,
@@ -120,20 +136,18 @@ init([{#ws{ip = IP, http_opts = HOpts}, _} = WS]) ->
                                ({resend_on_timeout, _}) -> true;
                                (_) -> false
                             end, HOpts),
-    Opts = [{xml_socket, true} | ejabberd_c2s_config:get_c2s_limits() ++ SOpts],
+    Opts = ejabberd_c2s_config:get_c2s_limits() ++ SOpts,
     PingInterval = ejabberd_config:get_option(
                      {websocket_ping_interval, ?MYNAME},
-                     fun(I) when is_integer(I), I>=0 -> I end,
                      ?PING_INTERVAL) * 1000,
     WSTimeout = ejabberd_config:get_option(
                   {websocket_timeout, ?MYNAME},
-                  fun(I) when is_integer(I), I>0 -> I end,
                   ?WEBSOCKET_TIMEOUT) * 1000,
     Socket = {http_ws, self(), IP},
     ?DEBUG("Client connected through websocket ~p",
 	   [Socket]),
-    ejabberd_socket:start(ejabberd_c2s, ?MODULE, Socket,
-			  Opts),
+    xmpp_socket:start(ejabberd_c2s, ?MODULE, Socket,
+		      [{receiver, self()}|Opts]),
     Timer = erlang:start_timer(WSTimeout, self(), []),
     {ok, loop,
      #state{socket = Socket, timeout = WSTimeout,
@@ -237,6 +251,7 @@ handle_info(PingPong, StateName, StateData) when PingPong == ping orelse
      StateData2#state{pong_expected = false}};
 handle_info({timeout, Timer, _}, _StateName,
 	    #state{timer = Timer} = StateData) ->
+    ?DEBUG("Closing websocket connection from hitting inactivity timeout", []),
     {stop, normal, StateData};
 handle_info({timeout, Timer, _}, StateName,
 	    #state{ping_timer = Timer, ws = {_, WsPid}} = StateData) ->
@@ -249,6 +264,7 @@ handle_info({timeout, Timer, _}, StateName,
             {next_state, StateName,
              StateData#state{ping_timer = PingTimer, pong_expected = true}};
         true ->
+	    ?DEBUG("Closing websocket connection from missing pongs", []),
             {stop, normal, StateData}
     end;
 handle_info(_, StateName, StateData) ->
@@ -283,7 +299,7 @@ cancel_timer(Timer) ->
     receive {timeout, Timer, _} -> ok after 0 -> ok end.
 
 get_human_html_xmlel() ->
-    Heading = <<"ejabberd ", (jlib:atom_to_binary(?MODULE))/binary>>,
+    Heading = <<"ejabberd ", (misc:atom_to_binary(?MODULE))/binary>>,
     #xmlel{name = <<"html">>,
            attrs =
                [{<<"xmlns">>, <<"http://www.w3.org/1999/xhtml">>}],

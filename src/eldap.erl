@@ -63,7 +63,7 @@
 %%%     active_bind - sent bind() request and waiting for response
 %%%----------------------------------------------------------------------
 
--behaviour(gen_fsm).
+-behaviour(p1_fsm).
 
 -include("ejabberd.hrl").
 -include("logger.hrl").
@@ -126,14 +126,15 @@
 -record(eldap,
 	{version = ?LDAP_VERSION :: non_neg_integer(),
          hosts = []              :: [binary()],
-         host                    :: binary(),
+         host = undefined        :: binary() | undefined,
 	 port = 389              :: inet:port_number(),
          sockmod = gen_tcp       :: ssl | gen_tcp,
          tls = none              :: none | tls,
-         tls_options = []        :: [{cacertfile, string()} |
+         tls_options = []        :: [{certfile, string()} |
+				     {cacertfile, string()} |
                                      {depth, non_neg_integer()} |
                                      {verify, non_neg_integer()}],
-	 fd,
+	 fd                      :: gen_tcp:socket() | undefined,
          rootdn = <<"">>         :: binary(),
          passwd = <<"">>         :: binary(),
          id = 0                  :: non_neg_integer(),
@@ -145,17 +146,17 @@
 %%% API
 %%%----------------------------------------------------------------------
 start_link(Name) ->
-    Reg_name = jlib:binary_to_atom(<<"eldap_",
+    Reg_name = misc:binary_to_atom(<<"eldap_",
 				       Name/binary>>),
-    gen_fsm:start_link({local, Reg_name}, ?MODULE, [], []).
+    p1_fsm:start_link({local, Reg_name}, ?MODULE, [], []).
 
 -spec start_link(binary(), [binary()], inet:port_number(), binary(),
                  binary(), tlsopts()) -> any().
 
 start_link(Name, Hosts, Port, Rootdn, Passwd, Opts) ->
-    Reg_name = jlib:binary_to_atom(<<"eldap_",
+    Reg_name = misc:binary_to_atom(<<"eldap_",
 				       Name/binary>>),
-    gen_fsm:start_link({local, Reg_name}, ?MODULE,
+    p1_fsm:start_link({local, Reg_name}, ?MODULE,
 		       [Hosts, Port, Rootdn, Passwd, Opts], []).
 
 -spec get_status(handle()) -> any().
@@ -165,7 +166,7 @@ start_link(Name, Hosts, Port, Rootdn, Passwd, Opts) ->
 %%% --------------------------------------------------------------------
 get_status(Handle) ->
     Handle1 = get_handle(Handle),
-    gen_fsm:sync_send_all_state_event(Handle1, get_status).
+    p1_fsm:sync_send_all_state_event(Handle1, get_status).
 
 %%% --------------------------------------------------------------------
 %%% Shutdown connection (and process) asynchronous.
@@ -174,7 +175,7 @@ get_status(Handle) ->
 
 close(Handle) ->
     Handle1 = get_handle(Handle),
-    gen_fsm:send_all_state_event(Handle1, close).
+    p1_fsm:send_all_state_event(Handle1, close).
 
 %%% --------------------------------------------------------------------
 %%% Add an entry. The entry field MUST NOT exist for the AddRequest
@@ -191,7 +192,7 @@ close(Handle) ->
 %%% --------------------------------------------------------------------
 add(Handle, Entry, Attributes) ->
     Handle1 = get_handle(Handle),
-    gen_fsm:sync_send_event(Handle1,
+    p1_fsm:sync_send_event(Handle1,
 			    {add, Entry, add_attrs(Attributes)}, ?CALL_TIMEOUT).
 
 %%% Do sanity check !
@@ -215,7 +216,7 @@ add_attrs(Attrs) ->
 %%% --------------------------------------------------------------------
 delete(Handle, Entry) ->
     Handle1 = get_handle(Handle),
-    gen_fsm:sync_send_event(Handle1, {delete, Entry},
+    p1_fsm:sync_send_event(Handle1, {delete, Entry},
 			    ?CALL_TIMEOUT).
 
 %%% --------------------------------------------------------------------
@@ -233,7 +234,7 @@ delete(Handle, Entry) ->
 
 modify(Handle, Object, Mods) ->
     Handle1 = get_handle(Handle),
-    gen_fsm:sync_send_event(Handle1, {modify, Object, Mods},
+    p1_fsm:sync_send_event(Handle1, {modify, Object, Mods},
 			    ?CALL_TIMEOUT).
 
 %%%
@@ -273,7 +274,7 @@ m(Operation, Type, Values) ->
 
 modify_dn(Handle, Entry, NewRDN, DelOldRDN, NewSup) ->
     Handle1 = get_handle(Handle),
-    gen_fsm:sync_send_event(Handle1,
+    p1_fsm:sync_send_event(Handle1,
 			    {modify_dn, Entry, NewRDN, bool_p(DelOldRDN),
 			     optional(NewSup)},
 			    ?CALL_TIMEOUT).
@@ -282,7 +283,7 @@ modify_dn(Handle, Entry, NewRDN, DelOldRDN, NewSup) ->
 
 modify_passwd(Handle, DN, Passwd) ->
     Handle1 = get_handle(Handle),
-    gen_fsm:sync_send_event(Handle1,
+    p1_fsm:sync_send_event(Handle1,
 			    {modify_passwd, DN, Passwd}, ?CALL_TIMEOUT).
 
 %%% --------------------------------------------------------------------
@@ -297,7 +298,7 @@ modify_passwd(Handle, DN, Passwd) ->
  
 bind(Handle, RootDN, Passwd) ->
     Handle1 = get_handle(Handle),
-    gen_fsm:sync_send_event(Handle1, {bind, RootDN, Passwd},
+    p1_fsm:sync_send_event(Handle1, {bind, RootDN, Passwd},
 			    ?CALL_TIMEOUT).
 
 %%% Sanity checks !
@@ -355,7 +356,7 @@ search(Handle, L) when is_list(L) ->
 
 call_search(Handle, A) ->
     Handle1 = get_handle(Handle),
-    gen_fsm:sync_send_event(Handle1, {search, A},
+    p1_fsm:sync_send_event(Handle1, {search, A},
 			    ?CALL_TIMEOUT).
 
 -spec parse_search_args(search_args()) -> eldap_search().
@@ -548,7 +549,7 @@ extensibleMatch_opts([], MRA) -> MRA.
 get_handle(Pid) when is_pid(Pid) -> Pid;
 get_handle(Atom) when is_atom(Atom) -> Atom;
 get_handle(Name) when is_binary(Name) ->
-    jlib:binary_to_atom(<<"eldap_",
+    misc:binary_to_atom(<<"eldap_",
 			    Name/binary>>).
 
 %%%----------------------------------------------------------------------
@@ -565,11 +566,7 @@ get_handle(Name) when is_binary(Name) ->
 %% process.      
 %%----------------------------------------------------------------------
 init([Hosts, Port, Rootdn, Passwd, Opts]) ->
-    Encrypt = case gen_mod:get_opt(encrypt, Opts,
-                                   fun(tls) -> tls;
-                                      (starttls) -> starttls;
-                                      (none) -> none
-                                   end) of
+    Encrypt = case proplists:get_value(encrypt, Opts) of
                   tls -> tls;
                   _ -> none
 	      end,
@@ -581,46 +578,36 @@ init([Hosts, Port, Rootdn, Passwd, Opts]) ->
 		     end;
 		 PT -> PT
 	       end,
-    CacertOpts = case gen_mod:get_opt(
-                        tls_cacertfile, Opts,
-                        fun(S) when is_binary(S) ->
-                                binary_to_list(S);
-                           (undefined) ->
-                                undefined
-                        end) of
+    CertOpts = case proplists:get_value(tls_certfile, Opts) of
+		   undefined ->
+		       [];
+		   Path1 ->
+		       [{certfile, Path1}]
+	       end,
+    CacertOpts = case proplists:get_value(tls_cacertfile, Opts) of
                      undefined ->
                          [];
-                     Path ->
-                         [{cacertfile, Path}]
+                     Path2 ->
+                         [{cacertfile, Path2}]
                  end,
-    DepthOpts = case gen_mod:get_opt(
-                       tls_depth, Opts,
-                       fun(I) when is_integer(I), I>=0 ->
-                               I;
-                          (undefined) ->
-                               undefined
-                       end) of
+    DepthOpts = case proplists:get_value(tls_depth, Opts) of
                     undefined ->
                         [];
                     Depth ->
                         [{depth, Depth}]
                 end,
-    Verify = gen_mod:get_opt(tls_verify, Opts,
-                             fun(hard) -> hard;
-                                (soft) -> soft;
-                                (false) -> false
-                             end, false),
+    Verify = proplists:get_value(tls_verify, Opts, false),
     TLSOpts = if (Verify == hard orelse Verify == soft)
 		   andalso CacertOpts == [] ->
 		     ?WARNING_MSG("TLS verification is enabled but no CA "
 				  "certfiles configured, so verification "
 				  "is disabled.",
 				  []),
-		     [];
+		     CertOpts;
 		 Verify == soft ->
-		     [{verify, 1}] ++ CacertOpts ++ DepthOpts;
+		     [{verify, 1}] ++ CertOpts ++ CacertOpts ++ DepthOpts;
 		 Verify == hard ->
-		     [{verify, 2}] ++ CacertOpts ++ DepthOpts;
+		     [{verify, 2}] ++ CertOpts ++ CacertOpts ++ DepthOpts;
 		 true -> []
 	      end,
     {ok, connecting,
@@ -650,7 +637,7 @@ active(Event, From, S) ->
 
 %%----------------------------------------------------------------------
 %% Func: handle_event/3
-%% Called when gen_fsm:send_all_state_event/2 is invoked.
+%% Called when p1_fsm:send_all_state_event/2 is invoked.
 %% Returns: {next_state, NextStateName, NextStateData}          |
 %%          {next_state, NextStateName, NextStateData, Timeout} |
 %%          {stop, Reason, NewStateData}                         
@@ -693,7 +680,7 @@ handle_info({Tag, _Socket, Data}, StateName, S)
     case catch recvd_packet(Data, S) of
       {response, Response, RequestType} ->
 	  NewS = case Response of
-		   {reply, Reply, To, S1} -> gen_fsm:reply(To, Reply), S1;
+		   {reply, Reply, To, S1} -> p1_fsm:reply(To, Reply), S1;
 		   {ok, S1} -> S1
 		 end,
 	  if StateName == active_bind andalso
@@ -722,7 +709,7 @@ handle_info({timeout, Timer, {cmd_timeout, Id}},
 	    StateName, S) ->
     case cmd_timeout(Timer, Id, S) of
       {reply, To, Reason, NewS} ->
-	  gen_fsm:reply(To, Reason),
+	  p1_fsm:reply(To, Reason),
 	  {next_state, StateName, NewS};
       {error, _Reason} -> {next_state, StateName, S}
     end;
@@ -1059,8 +1046,6 @@ polish([], Res, Ref) -> {Res, Ref}.
 %%-----------------------------------------------------------------------
 connect_bind(S) ->
     Host = next_host(S#eldap.host, S#eldap.hosts),
-    ?INFO_MSG("LDAP connection on ~s:~p",
-	      [Host, S#eldap.port]),
     Opts = if S#eldap.tls == tls ->
 		  [{packet, asn1}, {active, true}, {keepalive, true},
 		   binary
@@ -1069,6 +1054,8 @@ connect_bind(S) ->
 		  [{packet, asn1}, {active, true}, {keepalive, true},
 		   {send_timeout, ?SEND_TIMEOUT}, binary]
 	   end,
+    ?DEBUG("Connecting to LDAP server at ~s:~p with options ~p",
+	   [Host, S#eldap.port, Opts]),
     HostS = binary_to_list(Host),
     SocketData = case S#eldap.tls of
 		   tls ->
@@ -1093,9 +1080,8 @@ connect_bind(S) ->
 		{ok, connecting, NewS#eldap{host = Host}}
 	  end;
       {error, Reason} ->
-	  ?ERROR_MSG("LDAP connection failed:~n** Server: "
-		     "~s:~p~n** Reason: ~p~n** Socket options: ~p",
-		     [Host, S#eldap.port, Reason, Opts]),
+	  ?ERROR_MSG("LDAP connection to ~s:~b failed: ~s",
+		     [Host, S#eldap.port, format_error(SockMod, Reason)]),
 	  NewS = close_and_retry(S),
 	  {ok, connecting, NewS#eldap{host = Host}}
     end.
@@ -1134,3 +1120,15 @@ bump_id(#eldap{id = Id})
     when Id > (?MAX_TRANSACTION_ID) ->
     ?MIN_TRANSACTION_ID;
 bump_id(#eldap{id = Id}) -> Id + 1.
+
+format_error(SockMod, Reason) ->
+    Txt = case SockMod of
+	      ssl -> ssl:format_error(Reason);
+	      gen_tcp -> inet:format_error(Reason)
+	  end,
+    case Txt of
+	"unknown POSIX error" ->
+	    lists:flatten(io_lib:format("~p", [Reason]));
+	_ ->
+	    Txt
+    end.

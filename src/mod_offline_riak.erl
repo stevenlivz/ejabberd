@@ -1,21 +1,37 @@
 %%%-------------------------------------------------------------------
-%%% @author Evgeny Khramtsov <ekhramtsov@process-one.net>
-%%% @copyright (C) 2016, Evgeny Khramtsov
-%%% @doc
-%%%
-%%% @end
+%%% File    : mod_offline_riak.erl
+%%% Author  : Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%% Created : 15 Apr 2016 by Evgeny Khramtsov <ekhramtsov@process-one.net>
-%%%-------------------------------------------------------------------
+%%%
+%%%
+%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
+%%%
+%%% This program is free software; you can redistribute it and/or
+%%% modify it under the terms of the GNU General Public License as
+%%% published by the Free Software Foundation; either version 2 of the
+%%% License, or (at your option) any later version.
+%%%
+%%% This program is distributed in the hope that it will be useful,
+%%% but WITHOUT ANY WARRANTY; without even the implied warranty of
+%%% MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+%%% General Public License for more details.
+%%%
+%%% You should have received a copy of the GNU General Public License along
+%%% with this program; if not, write to the Free Software Foundation, Inc.,
+%%% 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+%%%
+%%%----------------------------------------------------------------------
+
 -module(mod_offline_riak).
 
 -behaviour(mod_offline).
 
--export([init/2, store_messages/5, pop_messages/2, remove_expired_messages/1,
+-export([init/2, store_message/1, pop_messages/2, remove_expired_messages/1,
 	 remove_old_messages/2, remove_user/2, read_message_headers/2,
 	 read_message/3, remove_message/3, read_all_messages/2,
-	 remove_all_messages/2, count_messages/2, import/2]).
+	 remove_all_messages/2, count_messages/2, import/1]).
 
--include("jlib.hrl").
+-include("xmpp.hrl").
 -include("mod_offline.hrl").
 
 %%%===================================================================
@@ -24,28 +40,11 @@
 init(_Host, _Opts) ->
     ok.
 
-store_messages(Host, {User, _}, Msgs, Len, MaxOfflineMsgs) ->
-    Count = if MaxOfflineMsgs =/= infinity ->
-                    Len + count_messages(User, Host);
-               true -> 0
-            end,
-    if
-        Count > MaxOfflineMsgs ->
-            {atomic, discard};
-        true ->
-	    try
-		lists:foreach(
-		  fun(#offline_msg{us = US,
-				   timestamp = TS} = M) ->
-			  ok = ejabberd_riak:put(
-				 M, offline_msg_schema(),
-				 [{i, TS}, {'2i', [{<<"us">>, US}]}])
-		  end, Msgs),
-		{atomic, ok}
-	    catch _:{badmatch, Err} ->
-		    {atomic, Err}
-	    end
-    end.
+store_message(#offline_msg{us = US, packet = Pkt, timestamp = TS} = M) ->
+    El = xmpp:encode(Pkt),
+    ejabberd_riak:put(M#offline_msg{packet = El},
+		      offline_msg_schema(),
+		      [{i, TS}, {'2i', [{<<"us">>, US}]}]).
 
 pop_messages(LUser, LServer) ->
     case ejabberd_riak:get_by_index(offline_msg, offline_msg_schema(),
@@ -85,9 +84,7 @@ read_message_headers(LUser, LServer) ->
 		     fun(#offline_msg{from = From, to = To, packet = Pkt,
 				      timestamp = TS}) ->
 			     Seq = now_to_integer(TS),
-			     NewPkt = jlib:add_delay_info(
-					Pkt, LServer, TS, <<"Offline Storage">>),
-			     {Seq, From, To, NewPkt}
+			     {Seq, From, To, TS, Pkt}
 		     end, Rs),
 	    lists:keysort(1, Hdrs);
 	_Err ->
@@ -132,7 +129,7 @@ count_messages(LUser, LServer) ->
             0
     end.
 
-import(_LServer, #offline_msg{us = US, timestamp = TS} = M) ->
+import(#offline_msg{us = US, timestamp = TS} = M) ->
     ejabberd_riak:put(M, offline_msg_schema(),
 		      [{i, TS}, {'2i', [{<<"us">>, US}]}]).
 

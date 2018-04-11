@@ -5,7 +5,7 @@
 %%% Created :  6 Sep 2016 by Holger Weiss <holger@zedat.fu-berlin.de>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2016   ProcessOne
+%%% ejabberd, Copyright (C) 2016-2018   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -28,7 +28,6 @@
 -author('holger@zedat.fu-berlin.de').
 
 -include("pubsub.hrl").
--include("jlib.hrl").
 
 -export([init/3, terminate/2, options/0, features/0,
     create_node_permission/6, create_node/2, delete_node/1,

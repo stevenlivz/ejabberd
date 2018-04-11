@@ -1,6 +1,6 @@
 # ----------------------------------------------------------------------
 #
-# ejabberd, Copyright (C) 2002-2016   ProcessOne
+# ejabberd, Copyright (C) 2002-2017   ProcessOne
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License as
@@ -32,7 +32,7 @@ defmodule EjabberdAuthMock do
 
 		{:ok, _pid} = Agent.start_link(fn -> %{} end, name: @agent)
 
-		mock(:ejabberd_auth, :is_user_exists,
+		mock(:ejabberd_auth, :user_exists,
 			fn (user, domain)  ->
 				Agent.get(@agent, fn users -> Map.get(users, {user, domain}) end) != nil
 			end)

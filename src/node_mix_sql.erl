@@ -1,11 +1,27 @@
 %%%-------------------------------------------------------------------
-%%% @author Evgeny Khramtsov <ekhramtsov@process-one.net>
-%%% @copyright (C) 2016, Evgeny Khramtsov
-%%% @doc
-%%%
-%%% @end
+%%% File    : node_mix_sql.erl
+%%% Author  : Evgeny Khramtsov <ekhramtsov@process-one.net>
 %%% Created :  8 Mar 2016 by Evgeny Khramtsov <ekhramtsov@process-one.net>
-%%%-------------------------------------------------------------------
+%%%
+%%%
+%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
+%%%
+%%% This program is free software; you can redistribute it and/or
+%%% modify it under the terms of the GNU General Public License as
+%%% published by the Free Software Foundation; either version 2 of the
+%%% License, or (at your option) any later version.
+%%%
+%%% This program is distributed in the hope that it will be useful,
+%%% but WITHOUT ANY WARRANTY; without even the implied warranty of
+%%% MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+%%% General Public License for more details.
+%%%
+%%% You should have received a copy of the GNU General Public License along
+%%% with this program; if not, write to the Free Software Foundation, Inc.,
+%%% 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+%%%
+%%%----------------------------------------------------------------------
+
 -module(node_mix_sql).
 
 -behaviour(gen_pubsub_node).
@@ -21,6 +37,7 @@
     get_subscriptions/2, set_subscriptions/4,
     get_pending_nodes/2, get_states/1, get_state/2,
     set_state/1, get_items/7, get_items/3, get_item/7,
+    get_last_items/3,
     get_item/2, set_item/1, get_item_name/3, node_to_path/1,
     path_to_node/1, get_entity_subscriptions_for_send_last/2]).
 
@@ -36,41 +53,10 @@ terminate(Host, ServerHost) ->
     node_flat_sql:terminate(Host, ServerHost).
 
 options() ->
-    [{deliver_payloads, true},
-	{notify_config, false},
-	{notify_delete, false},
-	{notify_retract, true},
-	{purge_offline, false},
-	{persist_items, true},
-	{max_items, ?MAXITEMS},
-	{subscribe, true},
-	{access_model, open},
-	{roster_groups_allowed, []},
-	{publish_model, open},
-	{notification_type, headline},
-	{max_payload_size, ?MAX_PAYLOAD_SIZE},
-	{send_last_published_item, never},
-	{deliver_notifications, true},
-        {broadcast_all_resources, true},
-	{presence_based_delivery, false},
-	{itemreply, none}].
+    [{sql, true}, {rsm, true} | node_mix:options()].
 
 features() ->
-    [<<"create-nodes">>,
-	<<"delete-nodes">>,
-	<<"delete-items">>,
-	<<"instant-nodes">>,
-	<<"item-ids">>,
-	<<"outcast-affiliation">>,
-	<<"persistent-items">>,
-	<<"publish">>,
-	<<"purge-nodes">>,
-	<<"retract-items">>,
-	<<"retrieve-affiliations">>,
-	<<"retrieve-items">>,
-	<<"retrieve-subscriptions">>,
-	<<"subscribe">>,
-	<<"subscription-notifications">>].
+    [<<"rsm">> | node_mix:features()].
 
 create_node_permission(Host, ServerHost, Node, ParentNode, Owner, Access) ->
     node_flat_sql:create_node_permission(Host, ServerHost, Node, ParentNode, Owner, Access).
@@ -144,6 +130,9 @@ get_items(Nidx, From, RSM) ->
 get_items(Nidx, JID, AccessModel, PresenceSubscription, RosterGroup, SubId, RSM) ->
     node_flat_sql:get_items(Nidx, JID, AccessModel,
 	PresenceSubscription, RosterGroup, SubId, RSM).
+
+get_last_items(Nidx, From, Count) ->
+    node_flat_sql:get_last_items(Nidx, From, Count).
 
 get_item(Nidx, ItemId) ->
     node_flat_sql:get_item(Nidx, ItemId).

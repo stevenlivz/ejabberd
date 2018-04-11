@@ -5,7 +5,7 @@
 %%% Created :  4 May 2008 by Badlop <badlop@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2016   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -55,12 +55,12 @@
 
 -behaviour(gen_mod).
 
--export([start/2, stop/1, process/2, mod_opt_type/1, depends/2]).
+-export([start/2, stop/1, reload/3, process/2, mod_options/1, depends/2]).
 
 -include("ejabberd.hrl").
 -include("logger.hrl").
 
--include("jlib.hrl").
+-include("xmpp.hrl").
 
 -include("ejabberd_http.hrl").
 
@@ -75,6 +75,9 @@ start(_Host, _Opts) ->
     ok.
 
 stop(_Host) -> ok.
+
+reload(_Host, _NewOpts, _OldOpts) ->
+    ok.
 
 depends(_Host, _Opts) ->
     [{mod_register, hard}].
@@ -103,7 +106,7 @@ process([<<"new">>],
 		 lang = Lang, host = _HTTPHost}) ->
     case form_new_post(Q) of
       {success, ok, {Username, Host, _Password}} ->
-	  Jid = jid:make(Username, Host, <<"">>),
+	  Jid = jid:make(Username, Host),
           mod_register:send_registration_notifications(?MODULE, Jid, Ip),
 	  Text = (?T(<<"Your Jabber account was successfully "
 		       "created.">>)),
@@ -153,10 +156,14 @@ process(_Path, _Request) ->
 %%%----------------------------------------------------------------------
 
 serve_css() ->
-    {200,
-     [{<<"Content-Type">>, <<"text/css">>}, last_modified(),
-      cache_control_public()],
-     css()}.
+    case css() of
+	{ok, CSS} ->
+	    {200,
+	     [{<<"Content-Type">>, <<"text/css">>}, last_modified(),
+	      cache_control_public()], CSS};
+	error ->
+	    {404, [], "CSS not found"}
+    end.
 
 last_modified() ->
     {<<"Last-Modified">>,
@@ -165,16 +172,30 @@ last_modified() ->
 cache_control_public() ->
     {<<"Cache-Control">>, <<"public">>}.
 
+-spec css() -> {ok, binary()} | error.
 css() ->
-    <<"html,body {\nbackground: white;\nmargin: "
-      "0;\npadding: 0;\nheight: 100%;\n}">>.
+    Dir = misc:css_dir(),
+    File = filename:join(Dir, "register.css"),
+    case file:read_file(File) of
+	{ok, Data} ->
+	    {ok, Data};
+	{error, Why} ->
+	    ?ERROR_MSG("failed to read ~s: ~s", [File, file:format_error(Why)]),
+	    error
+    end.
+
+meta() ->
+    ?XA(<<"meta">>,
+	[{<<"name">>, <<"viewport">>},
+	 {<<"content">>, <<"width=device-width, initial-scale=1">>}]).
 
 %%%----------------------------------------------------------------------
 %%% Index page
 %%%----------------------------------------------------------------------
 
 index_page(Lang) ->
-    HeadEls = [?XCT(<<"title">>,
+    HeadEls = [meta(),
+	       ?XCT(<<"title">>,
 		    <<"Jabber Account Registration">>),
 	       ?XA(<<"link">>,
 		   [{<<"href">>, <<"/register/register.css">>},
@@ -203,7 +224,8 @@ index_page(Lang) ->
 
 form_new_get(Host, Lang, IP) ->
     CaptchaEls = build_captcha_li_list(Lang, IP),
-    HeadEls = [?XCT(<<"title">>,
+    HeadEls = [meta(),
+	       ?XCT(<<"title">>,
 		    <<"Register a Jabber account">>),
 	       ?XA(<<"link">>,
 		   [{<<"href">>, <<"/register/register.css">>},
@@ -334,7 +356,7 @@ build_captcha_li_list2(Lang, IP) ->
     case ejabberd_captcha:create_captcha(SID, From, To,
 					 Lang, IP, Args)
 	of
-      {ok, Id, _} ->
+      {ok, Id, _, _} ->
 	  {_, {CImg, CText, CId, CKey}} =
 	      ejabberd_captcha:build_captcha_html(Id, Lang),
 	  [?XE(<<"li">>,
@@ -347,7 +369,8 @@ build_captcha_li_list2(Lang, IP) ->
 %%%----------------------------------------------------------------------
 
 form_changepass_get(Host, Lang) ->
-    HeadEls = [?XCT(<<"title">>, <<"Change Password">>),
+    HeadEls = [meta(),
+	       ?XCT(<<"title">>, <<"Change Password">>),
 	       ?XA(<<"link">>,
 		   [{<<"href">>, <<"/register/register.css">>},
 		    {<<"type">>, <<"text/css">>},
@@ -435,7 +458,7 @@ change_password(Username, Host, PasswordOld,
     end.
 
 check_account_exists(Username, Host) ->
-    case ejabberd_auth:is_user_exists(Username, Host) of
+    case ejabberd_auth:user_exists(Username, Host) of
       true -> account_exists;
       false -> account_doesnt_exist
     end.
@@ -453,7 +476,8 @@ check_password(Username, Host, Password) ->
 %%%----------------------------------------------------------------------
 
 form_del_get(Host, Lang) ->
-    HeadEls = [?XCT(<<"title">>,
+    HeadEls = [meta(),
+	       ?XCT(<<"title">>,
 		    <<"Unregister a Jabber account">>),
 	       ?XA(<<"link">>,
 		   [{<<"href">>, <<"/register/register.css">>},
@@ -493,10 +517,8 @@ form_del_get(Host, Lang) ->
 %%                                    {error, not_allowed} |
 %%                                    {error, invalid_jid}
 register_account(Username, Host, Password) ->
-    Access = gen_mod:get_module_opt(Host, mod_register, access,
-                                    fun(A) -> A end,
-                                    all),
-    case jid:make(Username, Host, <<"">>) of
+    Access = gen_mod:get_module_opt(Host, mod_register, access),
+    case jid:make(Username, Host) of
       error -> {error, invalid_jid};
       JID ->
         case acl:match_rule(Host, Access, JID) of
@@ -509,8 +531,8 @@ register_account2(Username, Host, Password) ->
     case ejabberd_auth:try_register(Username, Host,
 				    Password)
 	of
-      {atomic, Res} ->
-	  {success, Res, {Username, Host, Password}};
+      ok ->
+	  {success, ok, {Username, Host, Password}};
       Other -> Other
     end.
 
@@ -580,4 +602,5 @@ get_error_text({error, passwords_not_identical}) ->
 get_error_text({error, wrong_parameters}) ->
     <<"Wrong parameters in the web formulary">>.
 
-mod_opt_type(_) -> [].
+mod_options(_) ->
+    [].

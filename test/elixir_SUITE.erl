@@ -1,7 +1,26 @@
 %%%-------------------------------------------------------------------
-%%% @author Mickael Remond <mremond@process-one.net>
-%%% @copyright (C) 2002-2016, ProcessOne
-%%% @doc
+%%% Author  : Mickael Remond <mremond@process-one.net>
+%%% Created : 19 Feb 2015 by Mickael Remond <mremond@process-one.net>
+%%%
+%%%
+%%% ejabberd, Copyright (C) 2002-2017   ProcessOne
+%%%
+%%% This program is free software; you can redistribute it and/or
+%%% modify it under the terms of the GNU General Public License as
+%%% published by the Free Software Foundation; either version 2 of the
+%%% License, or (at your option) any later version.
+%%%
+%%% This program is distributed in the hope that it will be useful,
+%%% but WITHOUT ANY WARRANTY; without even the implied warranty of
+%%% MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+%%% General Public License for more details.
+%%%
+%%% You should have received a copy of the GNU General Public License along
+%%% with this program; if not, write to the Free Software Foundation, Inc.,
+%%% 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+%%%
+%%%----------------------------------------------------------------------
+
 %%% This is a common test wrapper to run our ejabberd tests written in
 %%% Elixir from standard common test code.
 %%%
@@ -9,9 +28,6 @@
 %%%     ./rebar skip_deps=true ct suites=elixir
 %%% or from ejabber overall test suite:
 %%%     make quicktest
-%%% @end
-%%% Created :  19 Feb 2015 by Mickael Remond <mremond@process-one.net>
-%%%-------------------------------------------------------------------
 
 -module(elixir_SUITE).
 
@@ -22,6 +38,9 @@ init_per_suite(Config) ->
     check_meck(),
     code:add_pathz(filename:join(test_dir(), "../include")),
     Config.
+
+end_per_suite(_Config) ->
+    ok.
 
 init_per_testcase(_TestCase, Config) ->
     process_flag(error_handler, ?MODULE),
@@ -69,7 +88,11 @@ undefined_function(Module, Func, Args) ->
 run_elixir_test(Func) ->
     %% Elixir tests can be tagged as follow to be ignored (place before test start)
     %% @tag pending: true
-    'Elixir.ExUnit':start([{exclude, [{pending, true}]}, {formatters, ['Elixir.ExUnit.CLIFormatter', 'Elixir.ExUnit.CTFormatter']}]),
+    'Elixir.ExUnit':start([{exclude, [{pending, true}]},
+			   {formatters,
+			    ['Elixir.ExUnit.CLIFormatter',
+			     'Elixir.ExUnit.CTFormatter']},
+			   {autorun, false}]),
 
     filelib:fold_files(test_dir(), ".*mock\.exs\$", true,
                        fun (File, N) ->
@@ -79,6 +102,7 @@ run_elixir_test(Func) ->
 
     'Elixir.Code':load_file(list_to_binary(filename:join(test_dir(), atom_to_list(Func)))),
     %% I did not use map syntax, so that this file can still be build under R16
+    catch 'Elixir.ExUnit.Server':cases_loaded(),
     ResultMap = 'Elixir.ExUnit':run(),
     case maps:find(failures, ResultMap) of
         {ok, 0} ->

@@ -5,7 +5,7 @@
 %%% Created : 27 Jul 2016 by Alexey Shchepin <alexey@process-one.net>
 %%%
 %%%
-%%% ejabberd, Copyright (C) 2002-2016   ProcessOne
+%%% ejabberd, Copyright (C) 2002-2018   ProcessOne
 %%%
 %%% This program is free software; you can redistribute it and/or
 %%% modify it under the terms of the GNU General Public License as
@@ -25,7 +25,7 @@
 %%%-------------------------------------------------------------------
 
 -module(ejabberd_oauth_sql).
-
+-behaviour(ejabberd_oauth).
 -compile([{parse_transform, ejabberd_sql_pt}]).
 
 -export([init/0,
@@ -36,7 +36,8 @@
 -include("ejabberd_oauth.hrl").
 -include("ejabberd.hrl").
 -include("ejabberd_sql_pt.hrl").
--include("jlib.hrl").
+-include("jid.hrl").
+-include("logger.hrl").
 
 init() ->
     ok.
@@ -44,16 +45,21 @@ init() ->
 store(R) ->
     Token = R#oauth_token.token,
     {User, Server} = R#oauth_token.us,
-    SJID = jid:to_string({User, Server, <<"">>}),
+    SJID = jid:encode({User, Server, <<"">>}),
     Scope = str:join(R#oauth_token.scope, <<" ">>),
     Expire = R#oauth_token.expire,
-    ?SQL_UPSERT(
-       ?MYNAME,
-       "oauth_token",
-       ["!token=%(Token)s",
-        "jid=%(SJID)s",
-        "scope=%(Scope)s",
-        "expire=%(Expire)d"]).
+    case ?SQL_UPSERT(
+	    ?MYNAME,
+	    "oauth_token",
+	    ["!token=%(Token)s",
+	     "jid=%(SJID)s",
+	     "scope=%(Scope)s",
+	     "expire=%(Expire)d"]) of
+	ok ->
+	    ok;
+	_ ->
+	    {error, db_failure}
+    end.
 
 lookup(Token) ->
     case ejabberd_sql:sql_query(
@@ -61,14 +67,14 @@ lookup(Token) ->
            ?SQL("select @(jid)s, @(scope)s, @(expire)d"
                 " from oauth_token where token=%(Token)s")) of
         {selected, [{SJID, Scope, Expire}]} ->
-            JID = jid:from_string(SJID),
+            JID = jid:decode(SJID),
             US = {JID#jid.luser, JID#jid.lserver},
-            #oauth_token{token = Token,
-                         us = US,
-                         scope = str:tokens(Scope, <<" ">>),
-                         expire = Expire};
+            {ok, #oauth_token{token = Token,
+			      us = US,
+			      scope = str:tokens(Scope, <<" ">>),
+			      expire = Expire}};
         _ ->
-            false
+            error
     end.
 
 clean(TS) ->
